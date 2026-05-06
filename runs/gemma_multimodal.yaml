@@ -9,6 +9,8 @@ max_new_tokens: 64
 
 steps:
   train: true
-  compile_corpus: false
   evaluate_latent_memory: true
   evaluate_baselines: true
+
+optional:
+  build_memory_bank: false
