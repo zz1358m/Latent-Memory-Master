@@ -1,0 +1,14 @@
+# Gemma multimodal Latent Memory/model-swap run.
+config: configs/config_gemma3_4B_12B.yaml
+train_data: data/webqa_train.json
+val_data: data/webqa_val.json
+checkpoint: checkpoints/gemma_multimodal/model.pt
+output_dir: results/gemma_webqa
+top_k_values: [5]
+max_new_tokens: 64
+
+steps:
+  train: true
+  compile_corpus: false
+  evaluate_latent_memory: true
+  evaluate_baselines: true

@@ -27,6 +27,7 @@ grad through input_embeds) → latent_token → CrossModelProjection → 1B comp
 import logging
 import torch
 import torch.nn.functional as F
+from jinja2.exceptions import TemplateError
 
 logger = logging.getLogger(__name__)
 
@@ -60,14 +61,38 @@ def _split_chat_template(generator_tokenizer, query: str):
     """
     chat_template = getattr(generator_tokenizer, "chat_template", None)
     if chat_template:
-        full = generator_tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": _SYSTEM_MSG},
-                {"role": "user", "content": f"{_PLACEHOLDER}\nQuestion: {query}"},
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        tok_name = str(getattr(generator_tokenizer, "name_or_path", "")).lower()
+        tok_cls = generator_tokenizer.__class__.__name__.lower()
+        if "gemma-3" in tok_name or "gemma3" in tok_cls:
+            user_content = [{
+                "type": "text",
+                "text": f"{_SYSTEM_MSG}\n\n{_PLACEHOLDER}\nQuestion: {query}",
+            }]
+            full = generator_tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            system_content = _SYSTEM_MSG
+            user_content = f"{_PLACEHOLDER}\nQuestion: {query}"
+            try:
+                full = generator_tokenizer.apply_chat_template(
+                    [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except TemplateError as exc:
+                if "System role not supported" not in str(exc):
+                    raise
+                full = generator_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": f"{_SYSTEM_MSG}\n\n{user_content}"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
     else:
         bos = generator_tokenizer.bos_token or ""
         full = (

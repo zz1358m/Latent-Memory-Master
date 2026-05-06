@@ -12,7 +12,7 @@ All saved under SAVE_ROOT, matching the paths in config.yaml.
 
 Usage:
     python scripts/download_baselines.py
-    python scripts/download_baselines.py --save_root /scratch/e1374322
+    python scripts/download_baselines.py --save_root models
     python scripts/download_baselines.py --models llmlingua xrag
 """
 
@@ -44,7 +44,7 @@ def download(repo_id: str, save_root: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--save_root", default="/scratch/e1374322",
+        "--save_root", default="models",
         help="Root directory under which models are saved (mirrors HF repo structure)"
     )
     parser.add_argument(

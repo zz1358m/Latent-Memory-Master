@@ -2,7 +2,8 @@
 Run Evaluation Experiment
 ==========================
 Compares the proposed latent retrieval system against three baselines.
-Supports in-distribution (HotpotQA) and OOD datasets (2WikiMultiHopQA, MuSiQue).
+Supports in-distribution (HotpotQA) and multiple OOD datasets including
+2WikiMultiHopQA, MuSiQue, NQ, TriviaQA, LongBench-Qasper, and WICE.
 
 Proposed system (latent retrieval):
   1B compressor (LoRA) → CrossModelProjection → frozen 8B generator
@@ -27,7 +28,7 @@ Multi-k sweep mode (--k_list):
       --k_list 1,2,3,5,10 \\
       [--max_samples 500] \\
       [--skip_baselines] \\
-      [--ood_datasets 2wikimultihopqa,musique]
+      [--ood_datasets 2wikimultihopqa,musique,nq,triviaqa,qasper_longbench,wice]
 """
 
 import argparse
@@ -36,6 +37,10 @@ import logging
 import os
 import sys
 
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
+
 import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -43,7 +48,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from data.prepare_data import load_dataset_by_name, load_hotpotqa
-from scripts.baselines import (
+from scripts.internal.baselines import (
     BM25RetrievalBaseline,
     DenseRetrievalBaseline,
     FullContextBaseline,
@@ -134,7 +139,7 @@ def _evaluate_dataset(
     skip_baselines: bool,
     skip_latent: bool = False,
     compression_cfg: dict = None,
-    baseline_batch_size: int = 1,
+    baseline_batch_size: int = 16,
     dump_full_examples: int = 0,
 ) -> dict:
     """Run latent retrieval + optional baselines on one dataset. Returns results dict."""
@@ -191,7 +196,7 @@ def _evaluate_dataset_multi_k(
     skip_baselines: bool,
     skip_latent: bool = False,
     compression_cfg: dict = None,
-    baseline_batch_size: int = 1,
+    baseline_batch_size: int = 16,
     latent_compress_batch_size: int = 128,
     latent_gen_batch_size: int = 16,
     dump_full_examples: int = 0,
@@ -246,6 +251,8 @@ def _evaluate_dataset_multi_k(
             device=device,
             compress_batch_size=latent_compress_batch_size,
             gen_batch_size=latent_gen_batch_size,
+            dump_examples=dump_full_examples,
+            dump_dir=os.path.join(output_dir, tag),
         )
         all_latent_metrics = runner.run_multi_k(samples, k_list)
         for k in k_list:
@@ -261,6 +268,8 @@ def _evaluate_dataset_multi_k(
                 max_new_tokens=max_new_tokens,
                 device=device,
                 batch_size=baseline_batch_size,
+                dump_examples=dump_full_examples,
+                dump_dir=os.path.join(output_dir, tag),
             )
         except ImportError as e:
             logger.warning(f"DenseRetrievalBaseline unavailable: {e}")
@@ -275,7 +284,11 @@ def _evaluate_dataset_multi_k(
 
         if not skip_baselines:
             bm25 = BM25RetrievalBaseline(
-                generator, gen_tokenizer, k, max_new_tokens, device, batch_size=baseline_batch_size
+                generator, gen_tokenizer, k, max_new_tokens, device,
+                batch_size=baseline_batch_size,
+                dump_examples=dump_full_examples,
+                dump_dir=os.path.join(output_dir, tag),
+                dump_name_suffix=f"_k{k}",
             )
             bm25_metrics = bm25.run(samples)
             k_results["BM25Retrieval"] = bm25_metrics
@@ -283,6 +296,7 @@ def _evaluate_dataset_multi_k(
 
             if dense_baseline is not None:
                 dense_baseline.top_k = k
+                dense_baseline.dump_name_suffix = f"_k{k}"
                 dense_metrics = dense_baseline.run(samples)
                 k_results["DenseRetrieval"] = dense_metrics
                 print_results(dense_metrics, f"[{tag}] Dense k={k}")
@@ -369,7 +383,7 @@ def main(args):
 
     # --- Build dataset list ---
     if args.dataset:
-        dataset_names = [args.dataset]
+        dataset_names = [d.strip() for d in args.dataset.split(",") if d.strip()]
     elif args.ood_datasets:
         dataset_names = []   # OOD-only run; hotpotqa not added automatically
     else:
@@ -425,6 +439,8 @@ def main(args):
                     device=device,
                     compress_batch_size=args.latent_compress_batch_size,
                     gen_batch_size=args.latent_gen_batch_size,
+                    dump_examples=args.dump_full_examples,
+                    dump_dir=os.path.join(args.output, ds_name),
                 )
             ds_results = _evaluate_dataset(
                 dataset_name=ds_name,
@@ -460,14 +476,14 @@ if __name__ == "__main__":
     parser.add_argument("--config",         default="config.yaml",               help="Path to config.yaml")
     parser.add_argument("--checkpoint",     default="checkpoints/model_best.pt", help="Trained autoencoder checkpoint")
     parser.add_argument("--output",         default="results/",                  help="Directory for result files")
-    parser.add_argument("--dataset",        default=None,                        help="Primary dataset (default: hotpotqa); also supports: nq, triviaqa, truthfulqa, webqa_text")
-    parser.add_argument("--ood_datasets",   default=None,                        help="Comma-separated extra datasets (e.g. '2wikimultihopqa,musique,nq,triviaqa')")
+    parser.add_argument("--dataset",        default=None,                        help="Primary dataset or comma-separated dataset list (default: hotpotqa); also supports: nq, triviaqa, qasper_longbench, wice, truthfulqa, webqa_text")
+    parser.add_argument("--ood_datasets",   default=None,                        help="Comma-separated extra datasets (e.g. '2wikimultihopqa,musique,nq,triviaqa,qasper_longbench,wice')")
     parser.add_argument("--max_samples",    type=int, default=None,              help="Max samples per dataset")
     parser.add_argument("--top_k",          type=int, default=None,              help="k for single-k mode (overrides config)")
     parser.add_argument("--k_list",         default=None,                        help="Comma-separated k values for multi-k sweep (e.g. '1,2,3,5,10')")
     parser.add_argument("--skip_baselines", action="store_true",                 help="Skip all baseline evaluation (BM25, Dense, FullContext, compression)")
     parser.add_argument("--skip_latent",    action="store_true",                 help="Skip latent retrieval; run only baselines (no autoencoder checkpoint needed)")
-    parser.add_argument("--baseline_batch_size", type=int, default=1,            help="Batch size for FullContext/BM25/Dense generation")
+    parser.add_argument("--baseline_batch_size", type=int, default=16,           help="Batch size for FullContext/BM25/Dense generation")
     parser.add_argument("--latent_compress_batch_size", type=int, default=128,   help="Batch size for latent validation compression/embedding passes")
     parser.add_argument("--latent_gen_batch_size", type=int, default=16,         help="Batch size for latent validation generation")
     parser.add_argument("--dump_full_examples", type=int, default=0,             help="Dump first N FullContext formatted examples to JSON")

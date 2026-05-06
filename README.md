@@ -1,84 +1,101 @@
-# Latent Retrieval over Compiled Memory
+# Latent Memory
 
-Latent Memory compiles each evidence item into a small latent memory, retrieves these memories at inference time, and feeds them directly to a frozen generation model.
+Release-oriented code for Latent Memory: compact latent evidence representations for retrieval-augmented question answering.
 
-## Install
+This repository contains the core `src/` modules and executable `scripts/` for three experiment families:
+
+- Text-only LLaMA experiments: LLaMA compressor with a frozen LLaMA generator.
+- LLaVA multimodal experiments: LLaVA compressor/generator over unified text-image evidence.
+- Gemma multimodal experiments: Gemma-family multimodal configuration files and compatible multimodal evaluation setup.
+
+## Layout
+
+```text
+src/        Core model, compressor, retrieval, evaluation, and memory-bank modules.
+scripts/    Training, corpus compilation, evaluation, and baseline entry points.
+configs/    YAML configs for text-only, LLaMA text-only, LLaVA multimodal, and Gemma multimodal experiment variants.
+```
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Main Experiments
+## Text-only LLaMA workflow
 
-This repository has two primary experiment tracks:
-
-1. text-only QA on HotpotQA / 2WikiMultihopQA / MuSiQue
-2. multimodal QA on WebQA with LLaVA or Qwen-VL backbones
-
-## Text-only: train and test
-
-Train the text-only compression model:
+Prepare data externally, then train and evaluate with the LLaMA text-only configuration:
 
 ```bash
-python scripts/train.py \
-    --config config.yaml \
-    --data data/hotpotqa_train.json \
-    --val_data data/hotpotqa_val.json \
-    --output checkpoints/model.pt
+python scripts/train.py --config configs/config.yaml --data data/hotpotqa_train.json --val_data data/hotpotqa_val.json --output checkpoints/text_llama.pt
+python scripts/compile_release.py --task text --config configs/config.yaml --compiler checkpoints/text_llama.pt --data data/hotpotqa_train.json --output memory_bank/text_llama
+python scripts/run_experiment.py --config configs/config.yaml --checkpoint checkpoints/text_llama.pt --output results/text_llama --top_k 5
 ```
 
-Evaluate the trained checkpoint on the main text-only setting:
+## LLaVA multimodal workflow
 
 ```bash
-python scripts/run_experiment.py \
-    --config config.yaml \
-    --checkpoint checkpoints/model_best.pt \
-    --dataset hotpotqa \
-    --ood_datasets 2wikimultihopqa,musique \
-    --k_list 1,2,5 \
-    --output results/
+python scripts/train_llava.py --config configs/config_llava.yaml
+python scripts/compile_release.py --task webqa --config configs/config_llava.yaml --checkpoint checkpoints/llava.pt --output memory_bank/llava_webqa
+python scripts/baselines_llava.py --config configs/config_llava.yaml --top_k 5
 ```
 
-## Multimodal: train and test
+## Gemma multimodal workflow
 
-Train the LLaVA-based WebQA compression model:
-
-```bash
-python scripts/train_llava.py \
-    --config config_llava.yaml \
-    --data data/webqa_train.json \
-    --val data/webqa_val.json \
-    --output checkpoints/llava_model.pt
-```
-
-Evaluate the trained LLaVA checkpoint on WebQA:
+Gemma configurations are provided under `configs/` (for example `config_gemma3_4B_12B.yaml`). Use the same multimodal training/evaluation pattern as LLaVA with the Gemma config selected:
 
 ```bash
-python scripts/baselines_llava.py \
-    --checkpoint checkpoints/llava_model_best.pt \
-    --config config_llava.yaml \
-    --val data/webqa_val.json \
-    --methods full_context bm25 dense latent \
-    --top_k_values 1 2 5 \
-    --max_samples 10000
-```
-
-If you use the Qwen-VL multimodal setting instead, evaluate with:
-
-```bash
-python scripts/baselines_qwen.py \
-    --checkpoint checkpoints/qwen_model_best.pt \
-    --config config_qwen.yaml \
-    --val data/webqa_val.json \
-    --methods full_context bm25 dense latent \
-    --top_k_values 1 2 5 \
-    --max_samples 10000
+python scripts/train_gemma.py --config configs/config_gemma3_4B_12B.yaml
+python scripts/baselines_gemma.py --config configs/config_gemma3_4B_12B.yaml --top_k 5
 ```
 
 ## Notes
 
-- `config.yaml` is the main text-only configuration.
-- `config_llava.yaml` and `config_qwen.yaml` are the multimodal configurations.
-- Text-only evaluation uses `scripts/run_experiment.py`.
-- WebQA multimodal evaluation uses `scripts/baselines_llava.py` or `scripts/baselines_qwen.py`.
-- Replace checkpoint paths above with your actual saved checkpoints.
+- Data, checkpoints, cache directories, and paper artifacts are intentionally excluded from this release scaffold.
+- Multimodal baseline token accounting includes effective visual-token expansion for full prompt, no-system, and context-only token statistics.
+- Before public release, add model checkpoint links or HuggingFace dataset/model cards as appropriate.
+
+## Main Python entry points
+
+The release exposes two unified command-line entry points:
+
+```bash
+python scripts/train_release.py --task text  --config configs/config.yaml
+python scripts/train_release.py --task llava --config configs/config_llava.yaml
+python scripts/train_release.py --task gemma --config configs/config_gemma3_4B_12B.yaml
+
+python scripts/eval_release.py --task text  --config configs/config.yaml --checkpoint checkpoints/text_llama/model.pt --output results/text_llama --top_k 5
+python scripts/eval_release.py --task llava --config configs/config_llava.yaml --top_k 5 --output results/llava_webqa
+python scripts/eval_release.py --task gemma --config configs/config_gemma3_4B_12B.yaml --top_k 5 --output results/gemma_webqa
+```
+
+Lower-level scripts are kept for transparency, but the run files in `runs/` call these unified entry points.## Ready-to-run entry points
+
+The release keeps only the main experiment entry points:
+
+```text
+runs/text_llama.yaml          runs/run_text_llama.sh
+runs/llava_multimodal.yaml    runs/run_llava_multimodal.sh
+runs/gemma_multimodal.yaml    runs/run_gemma_multimodal.sh
+```
+
+Example:
+
+```bash
+bash runs/run_text_llama.sh
+bash runs/run_llava_multimodal.sh
+bash runs/run_gemma_multimodal.sh
+```
+
+Edit the YAML or shell variables if your data/checkpoint paths differ from the defaults.
+## Python file layout
+
+The public `scripts/` directory intentionally exposes only three entry points:
+
+```text
+scripts/train_release.py
+scripts/compile_release.py
+scripts/eval_release.py
+```
+
+Task-specific implementations live in `scripts/internal/` so the release remains easy to navigate while preserving the original training and evaluation logic.

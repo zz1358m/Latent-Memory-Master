@@ -1,0 +1,86 @@
+# ============================================================
+# Gemma3-VL Latent Retrieval Configuration
+# Compressor : google/gemma-3-4b-pt
+# Generator  : google/gemma-3-12b-it
+# ============================================================
+
+model:
+  compressor_name: "google/gemma-3-4b-pt"
+  decoder_name:    "google/gemma-3-4b-pt"
+  generator_name:  "google/gemma-3-12b-it"
+  clip_model_name: "llava-hf/clip-vit-large-patch14-336"
+  dtype: "bfloat16"
+  generator_hidden: 3840
+
+compressor:
+  num_latent_tokens: 1
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  retrieval_dim: 512
+
+decoder:
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
+
+image:
+  scale: 0.1
+
+training:
+  learning_rate: 1.0e-4
+  batch_size: 8
+  image_batch_size: 8
+  gradient_accumulation_steps: 2
+  num_epochs: 2
+  warmup_steps: 50
+
+  lambda_recon:           0.5
+  lambda_contrast:        0.2
+  lambda_distill:         1.0
+  lambda_image_contrast:  0.2
+  lambda_image_distill:   2.0
+  lambda_embed_recon:     5.0
+  recon_negatives:        True
+  recon_query:            False
+  recon_title:            True
+
+  temperature: 0.07
+  max_hard_negatives: 4
+  max_neg_images: 4
+
+  n_distill_tokens: 16
+  student_distill_hard_negatives_max: 0
+
+  save_dir: "checkpoints/"
+  log_every: 1
+  val_every: 250
+  val_samples: 200
+  val_gen_batch_size: 1
+  val_compress_batch_size: 4
+
+data:
+  train: "data/webqa_train.json"
+  val:   "data/webqa_val.json"
+  max_samples: -1
+
+retrieval:
+  top_k: 5
+  index_type: "flat"
+
+generation:
+  max_new_tokens: 64
+
+visrag:
+  top_k_values: [1, 2, 5]
+  retrieval_method: "dense"
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  nemo_model: "nvidia/llama-nemotron-embed-vl-1b-v2"
+  qwen3vl_model: "Qwen/Qwen3-VL-Embedding-8B"
+
+paths:
+  checkpoint: "checkpoints/model.pt"
+  memory_bank: "memory_bank/"
+  results_dir: "results/"

@@ -1,0 +1,15 @@
+# Text-only LLaMA Latent Memory run.
+config: configs/config.yaml
+train_data: data/hotpotqa_train.json
+val_data: data/hotpotqa_val.json
+test_data: data/hotpotqa_val.json
+checkpoint: checkpoints/text_llama/model.pt
+memory_bank: memory_bank/text_llama
+output_dir: results/text_llama
+top_k: 5
+max_new_tokens: 64
+
+steps:
+  train: true
+  compile_corpus: true
+  evaluate: true

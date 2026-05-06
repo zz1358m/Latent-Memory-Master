@@ -29,6 +29,10 @@ import logging
 import os
 import sys
 
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
+
 import torch
 import yaml
 from tqdm import tqdm

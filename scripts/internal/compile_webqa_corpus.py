@@ -30,12 +30,16 @@ import logging
 import os
 import sys
 
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
+
 import torch
 import yaml
 from PIL import Image
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from data.prepare_webqa import load_webqa_samples
 from src.llava_compressor import LLaVACompressor
 from src.memory_bank import MemoryBank

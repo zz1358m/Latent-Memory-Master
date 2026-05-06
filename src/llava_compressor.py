@@ -72,6 +72,7 @@ Checkpoint format
   }
 """
 
+import gc
 import logging
 import os
 from typing import List, Optional
@@ -324,6 +325,11 @@ class LLaVACompressor(nn.Module):
     def _lm(self):
         return getattr(self._lm_parent, self._lm_attr)
 
+    def _llava_backbone(self):
+        # Calling the multimodal backbone avoids LM-head logits and all-layer
+        # hidden-state tensors during compression.
+        return self.model.model if hasattr(self.model, "model") else self.model
+
     def _set_adapter(self, name: str):
         lm = self._lm()
         lm.set_adapter(name)
@@ -447,25 +453,39 @@ class LLaVACompressor(nn.Module):
 
                 if pv is not None:
                     pv = pv.unsqueeze(0).to(device, dtype=torch.bfloat16)
-                    out = self.model(
+                    out = self._llava_backbone()(
                         input_ids=ids_with_mem,
                         pixel_values=pv,
                         attention_mask=attn_mask,
-                        output_hidden_states=True,
+                        output_hidden_states=False,
+                        use_cache=False,
                     )
                 else:
                     out = self._lm()(
                         input_ids=ids_with_mem,
                         attention_mask=attn_mask,
-                        output_hidden_states=True,
+                        output_hidden_states=False,
+                        use_cache=False,
                     )
 
-                # Hidden states at final positions = [MEM] latent tokens
-                h_mem = out.hidden_states[-1][0, -self.num_latent_tokens :, :].float()    # (T, hidden_size)
+                # Hidden states at final positions = [MEM] latent tokens.
+                last_hidden = getattr(out, "last_hidden_state", None)
+                if last_hidden is None:
+                    last_hidden = out.hidden_states[-1]
+                h_mem = last_hidden[0, -self.num_latent_tokens :, :].float()    # (T, hidden_size)
+                if not with_grad:
+                    h_mem = h_mem.detach().cpu()
 
                 # Add learnable [MEM] residual
-                h_mem = h_mem + self.mem_embedding.float()
+                mem_residual = self.mem_embedding.float()
+                if not with_grad:
+                    mem_residual = mem_residual.detach().cpu()
+                h_mem = h_mem + mem_residual
                 latents.append(h_mem)
+                if not with_grad:
+                    del out, last_hidden, ids, ids_with_mem, attn_mask, mem_residual
+                    if pv is not None:
+                        del pv
 
         return torch.stack(latents, dim=0)   # (B, T, hidden_size)
 
@@ -648,6 +668,7 @@ class LLaVACompressor(nn.Module):
         -------
         embeddings : (B, retrieval_dim) float32, L2-normalised
         """
+        latents = latents.to(self.mem_embedding.device)
         if latents.dim() == 3:
             latents = latents.mean(dim=1)
         proj = self.retrieval_proj(latents.float())    # (B, retrieval_dim) or (retrieval_dim,)
@@ -665,6 +686,7 @@ class LLaVACompressor(nn.Module):
         -------
         projected : (B, generator_hidden) float32
         """
+        latents = latents.to(self.mem_embedding.device)
         return self.cross_proj(latents.float())
 
     # ------------------------------------------------------------------ query embedding

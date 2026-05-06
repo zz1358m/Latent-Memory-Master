@@ -13,8 +13,8 @@ Differs from train_llava.py:
 
 Usage
 -----
-python scripts/train_qwen.py \\
-    --config config_qwen.yaml \\
+python scripts/train_gemma.py \\
+    --config config_gemma3_4B_12B.yaml \\
     --data   data/webqa_train.json \\
     --val    data/webqa_val.json \\
     --output checkpoints/qwen_model.pt
@@ -26,6 +26,10 @@ import logging
 import os
 import random
 import sys
+
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
 from typing import Dict, List, Optional
 
 import torch
@@ -43,12 +47,12 @@ except ImportError:
     _TB = False
     SummaryWriter = None
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
 from data.prepare_webqa import load_webqa_samples
 from src.distillation import _split_chat_template, _tok
-from src.qwen_compressor import QwenVLCompressor, resolve_qwen_vl_model_class
+from src.gemma_compressor import QwenVLCompressor, resolve_qwen_vl_model_class
 from src.region_encoder import image_doc_id, resize_image
 from src.retriever import ContrastiveRetriever
 
@@ -56,8 +60,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # Qwen2.5-VL-7B system prompt
-_QWEN_SYS = "You are a helpful assistant."
+_QWEN_SYS = (
+    "You are a helpful assistant. "
+    "Answer the question concisely (a few words or a short phrase) "
+    "based on the provided context."
+)
 _CTX_PLACEHOLDER = "ZZZCTXZZZ"
+
+
+def _extend_processor_forward_kwargs(enc, input_ids, attention_mask, dtype=torch.bfloat16):
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "use_cache": False,
+    }
+    for key in ("pixel_values", "image_grid_thw", "token_type_ids"):
+        if key not in enc:
+            continue
+        value = enc[key]
+        if key == "pixel_values":
+            value = value.to(dtype)
+        elif key == "token_type_ids" and value.shape[1] != input_ids.shape[1]:
+            pad_len = input_ids.shape[1] - value.shape[1]
+            value = torch.cat(
+                [
+                    value,
+                    torch.zeros(value.shape[0], pad_len, device=value.device, dtype=value.dtype),
+                ],
+                dim=1,
+            )
+        kwargs[key] = value
+    return kwargs
+
+
+def _is_gemma3_processor(processor) -> bool:
+    return "gemma3" in processor.__class__.__name__.lower()
+
+
+def _vl_system_message(processor):
+    if _is_gemma3_processor(processor):
+        return {"role": "system", "content": [{"type": "text", "text": _QWEN_SYS}]}
+    return {"role": "system", "content": _QWEN_SYS}
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +375,17 @@ def _qwen_distill_loss(
         n_distill_tokens: int,
 ) -> torch.Tensor:
     """
+    Legacy Qwen image-distillation implementation kept for reference.
+
+    Important: the current training pipeline does NOT call this function.
+    Active training uses `_qwen_distill_loss_hotpot(...)` below, where both
+    teacher and student are constructed from the same split chat scaffold and
+    the student inserts `Latent context i:` labels plus latent tokens.
+
+    This older path uses a different prompt realization for the student
+    (`Evidence 1 (latent): ...`) and is retained only to preserve the earlier
+    experimental implementation.
+
     KL distillation for image evidence.
     Teacher: Qwen2.5-VL-7B sees the real image via pixel_values + image_grid_thw.
     Student: Qwen2.5-VL-7B sees projected [MEM] latent as inputs_embeds (no image).
@@ -378,17 +432,20 @@ def _qwen_distill_loss(
     for q, sample_caps, sample_proj, pil_img in valid:
         try:
             # ── Teacher: Qwen2VL with real image ─────────────────────────────
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": pil_img},
-                    {"type": "text",  "text": (
-                        "Evidence 1: [image]\n"
-                        + "\n".join(f"Evidence {k+2}: {c}" for k, c in enumerate(sample_caps))
-                        + f"\nQuestion: {q}"
-                    )},
-                ],
-            }]
+            messages = [
+                _vl_system_message(gen_processor),
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": pil_img},
+                        {"type": "text",  "text": (
+                            "Evidence 1: [image]\n"
+                            + "\n".join(f"Evidence {k+2}: {c}" for k, c in enumerate(sample_caps))
+                            + f"\nQuestion: {q}"
+                        )},
+                    ],
+                },
+            ]
             teacher_text = gen_processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -424,11 +481,7 @@ def _qwen_distill_loss(
             # Step 3 – teacher forward (image_grid_thw describes original image)
             with torch.no_grad():
                 t_out = generator(
-                    input_ids=ext_ids,
-                    pixel_values=t_enc.pixel_values,
-                    image_grid_thw=t_enc.image_grid_thw,
-                    attention_mask=ext_mask,
-                    use_cache=False,
+                    **_extend_processor_forward_kwargs(t_enc, ext_ids, ext_mask, dtype)
                 )
             t_logits = t_out.logits[0, -n_distill_tokens:, :].float()   # (N, V)
 
@@ -470,7 +523,7 @@ def _qwen_distill_loss(
 def _split_qwen_image_chat_template(processor, query: str):
     full = processor.apply_chat_template(
         [
-            {"role": "system", "content": _QWEN_SYS},
+            _vl_system_message(processor),
             {
                 "role": "user",
                 "content": [
@@ -615,7 +668,10 @@ def _qwen_distill_loss_hotpot(
                 content.append({"type": "text", "text": f"Title: {cap}\n"})
             content.append({"type": "text", "text": f"Question: {q}"})
             teacher_text = gen_processor.apply_chat_template(
-                [{"role": "user", "content": content}],
+                [
+                    _vl_system_message(gen_processor),
+                    {"role": "user", "content": content},
+                ],
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -653,11 +709,7 @@ def _qwen_distill_loss_hotpot(
 
             with torch.no_grad():
                 t_out = generator(
-                    input_ids=ext_ids,
-                    pixel_values=t_enc.pixel_values,
-                    image_grid_thw=t_enc.image_grid_thw,
-                    attention_mask=ext_mask,
-                    use_cache=False,
+                    **_extend_processor_forward_kwargs(t_enc, ext_ids, ext_mask, dtype)
                 )
             t_logits = t_out.logits[0, -n_actual:, :].float()
         except Exception as e:
@@ -1766,15 +1818,6 @@ def run_validation_hotpot(
         pos_indices = []
         cursor = 0
 
-        if txt_end > txt_start and all_txt_latents is not None:
-            fact_latents = all_txt_latents[txt_start:txt_end]
-            fact_embs = all_txt_embs[txt_start:txt_end]
-            cand_latents.append(fact_latents)
-            cand_embs.append(fact_embs)
-            if s["modality"] == "text":
-                pos_indices.extend(range(cursor, cursor + s["txt_pos_count"]))
-            cursor += fact_latents.shape[0]
-
         if img_end > img_start and all_img_latents is not None:
             img_latents = all_img_latents[img_start:img_end]
             img_embs = all_img_embs[img_start:img_end]
@@ -1783,6 +1826,15 @@ def run_validation_hotpot(
             if s["modality"] == "image":
                 pos_indices.extend(range(cursor, cursor + s["img_pos_count"]))
             cursor += img_latents.shape[0]
+
+        if txt_end > txt_start and all_txt_latents is not None:
+            fact_latents = all_txt_latents[txt_start:txt_end]
+            fact_embs = all_txt_embs[txt_start:txt_end]
+            cand_latents.append(fact_latents)
+            cand_embs.append(fact_embs)
+            if s["modality"] == "text":
+                pos_indices.extend(range(cursor, cursor + s["txt_pos_count"]))
+            cursor += fact_latents.shape[0]
 
         if not cand_latents:
             continue
@@ -1938,7 +1990,7 @@ def dump_train_debug_examples(
                 content.append({"type": "text", "text": f"Title: {region[2]}\n"})
             content.append({"type": "text", "text": f"Question: {question}"})
             teacher_messages = [
-                {"role": "system", "content": _QWEN_SYS},
+                _vl_system_message(proc),
                 {"role": "user", "content": content},
             ]
             teacher_prompt = proc.apply_chat_template(
@@ -2004,7 +2056,7 @@ def train(args):
     generator_name = str(model_cfg.get("generator_name", "")).lower()
     if "llava" in compressor_name or "llava" in generator_name:
         raise ValueError(
-            "This config looks like an LLaVA setup, but you launched scripts/train_qwen.py. "
+            "This config looks like an LLaVA setup, but you launched scripts/train_gemma.py. "
             "Use scripts/train_llava.py with config_llava.yaml instead."
         )
 
@@ -2040,10 +2092,10 @@ def train(args):
         from transformers import AutoProcessor
         gen_name = model_cfg["generator_name"]
         gen_model_cls = resolve_qwen_vl_model_class(gen_name)
-        logger.info(f"Loading frozen Qwen VL generator with {gen_model_cls.__name__}: {gen_name}")
-        gen_processor = AutoProcessor.from_pretrained(gen_name)
+        logger.info(f"Loading frozen VL generator with {gen_model_cls.__name__}: {gen_name}")
+        gen_processor = AutoProcessor.from_pretrained(gen_name, trust_remote_code=True)
         generator = gen_model_cls.from_pretrained(
-            gen_name, torch_dtype=torch.bfloat16, device_map=device
+            gen_name, torch_dtype=torch.bfloat16, device_map=device, trust_remote_code=True
         )
         generator.eval()
         for p in generator.parameters():
@@ -2299,7 +2351,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Qwen2.5-VL Latent Retrieval")
-    parser.add_argument("--config",  required=True, help="Path to config_qwen.yaml")
+    parser.add_argument("--config",  required=True, help="Path to config_gemma3_4B_12B.yaml")
     parser.add_argument("--data",    default=None,  help="Override data.train path")
     parser.add_argument("--val",     default=None,  help="Override data.val path")
     parser.add_argument("--checkpoint", default=None, help="Load a compressor checkpoint before training/validation")

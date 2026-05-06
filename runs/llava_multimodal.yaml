@@ -1,0 +1,15 @@
+# LLaVA multimodal Latent Memory run on WebQA.
+config: configs/config_llava.yaml
+train_data: data/webqa_train.json
+val_data: data/webqa_val.json
+checkpoint: checkpoints/llava/model.pt
+memory_bank: memory_bank/llava_webqa
+output_dir: results/llava_webqa
+top_k_values: [5]
+max_new_tokens: 64
+
+steps:
+  train: true
+  compile_corpus: true
+  evaluate_latent_memory: true
+  evaluate_baselines: true

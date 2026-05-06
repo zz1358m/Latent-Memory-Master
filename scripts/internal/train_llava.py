@@ -32,6 +32,10 @@ import logging
 import os
 import random
 import sys
+
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
 from typing import Dict, List, Optional
 
 import torch
@@ -49,7 +53,7 @@ except ImportError:
     _TB = False
     SummaryWriter = None
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
 from data.prepare_webqa import load_webqa_samples
@@ -1537,15 +1541,6 @@ def run_validation_multi_k_unified(
             pos_indices = []
             cursor = 0
 
-            if txt_end > txt_start and all_txt_latents is not None:
-                fact_latents = all_txt_latents[txt_start:txt_end]
-                fact_embs = all_txt_embs[txt_start:txt_end]
-                cand_latents.append(fact_latents)
-                cand_embs.append(fact_embs)
-                if s["modality"] == "text":
-                    pos_indices.extend(range(cursor, cursor + s["txt_pos_count"]))
-                cursor += fact_latents.shape[0]
-
             if img_end > img_start and all_img_latents is not None:
                 img_latents = all_img_latents[img_start:img_end]
                 img_embs = all_img_embs[img_start:img_end]
@@ -1554,6 +1549,15 @@ def run_validation_multi_k_unified(
                 if s["modality"] == "image":
                     pos_indices.extend(range(cursor, cursor + s["img_pos_count"]))
                 cursor += img_latents.shape[0]
+
+            if txt_end > txt_start and all_txt_latents is not None:
+                fact_latents = all_txt_latents[txt_start:txt_end]
+                fact_embs = all_txt_embs[txt_start:txt_end]
+                cand_latents.append(fact_latents)
+                cand_embs.append(fact_embs)
+                if s["modality"] == "text":
+                    pos_indices.extend(range(cursor, cursor + s["txt_pos_count"]))
+                cursor += fact_latents.shape[0]
 
             if not cand_latents:
                 continue

@@ -130,6 +130,15 @@ def _log_local_config_json(model_name: str, tag: str):
 def resolve_qwen_vl_model_class(model_name: str):
     cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model_type = getattr(cfg, "model_type", None)
+    if model_type == "gemma3":
+        try:
+            from transformers import Gemma3ForConditionalGeneration
+            return Gemma3ForConditionalGeneration
+        except Exception as exc:
+            raise RuntimeError(
+                "This checkpoint is gemma3, but your transformers build does not expose "
+                "Gemma3ForConditionalGeneration. Gemma 3 requires transformers >= 4.50."
+            ) from exc
     if model_type == "qwen2_5_vl":
         try:
             from transformers import Qwen2_5_VLForConditionalGeneration
@@ -148,7 +157,7 @@ def resolve_qwen_vl_model_class(model_name: str):
 def resolve_decoder_model_class(model_name: str):
     cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model_type = getattr(cfg, "model_type", None)
-    if model_type in {"qwen2_vl", "qwen2_5_vl"}:
+    if model_type in {"qwen2_vl", "qwen2_5_vl", "gemma3"}:
         return "qwen_vl", resolve_qwen_vl_model_class(model_name)
     return "text", AutoModelForCausalLM
 
@@ -261,17 +270,19 @@ class QwenVLCompressor(nn.Module):
             decode_target_modules = list(target_modules)
 
         # ------------------------------------------------------------------ processor
-        logger.info(f"Loading Qwen2VL processor: {model_name}")
+        logger.info(f"Loading VL processor: {model_name}")
         _log_local_config_json(model_name, "Qwen base")
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         self.tokenizer  = self.processor.tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         try:
             base_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            self.base_model_type = getattr(base_cfg, "model_type", None)
             logger.info(f"Qwen base config summary ({model_name}): {_summarize_config(base_cfg)}")
         except Exception as exc:
+            self.base_model_type = None
             logger.warning(f"Failed to inspect base config for {model_name}: {exc}")
 
         # Register [MEM] as a new special token
@@ -280,9 +291,9 @@ class QwenVLCompressor(nn.Module):
 
         # ------------------------------------------------------------------ base model
         base_model_cls = resolve_qwen_vl_model_class(model_name)
-        logger.info(f"Loading Qwen VL base model with {base_model_cls.__name__}: {model_name}")
+        logger.info(f"Loading VL base model with {base_model_cls.__name__}: {model_name}")
         base = base_model_cls.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
+            model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
         base.resize_token_embeddings(len(self.tokenizer))
 
@@ -337,7 +348,7 @@ class QwenVLCompressor(nn.Module):
             logger.warning(f"Failed to inspect decoder config for {decoder_name}: {exc}")
         self.decoder_kind, decoder_model_cls = resolve_decoder_model_class(decoder_name)
         if self.decoder_kind == "qwen_vl":
-            self.decoder_processor = AutoProcessor.from_pretrained(decoder_name)
+            self.decoder_processor = AutoProcessor.from_pretrained(decoder_name, trust_remote_code=True)
             self.decoder_tokenizer = getattr(self.decoder_processor, "tokenizer", None)
             if self.decoder_tokenizer is None:
                 logger.warning(
@@ -358,7 +369,9 @@ class QwenVLCompressor(nn.Module):
             f"Loading decoder LM with {decoder_model_cls.__name__} "
             f"(kind={self.decoder_kind}): {decoder_name}"
         )
-        decoder_base = decoder_model_cls.from_pretrained(decoder_name, torch_dtype=torch.bfloat16)
+        decoder_base = decoder_model_cls.from_pretrained(
+            decoder_name, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
         if self.decoder_kind == "qwen_vl":
             self.decoder_hidden_size = get_qwen_vl_text_hidden_size(decoder_base.config)
         else:
@@ -441,6 +454,79 @@ class QwenVLCompressor(nn.Module):
             if "lora_" in n:
                 p.requires_grad_(True)
 
+    def _compress_forward(self, **kwargs):
+        kwargs.setdefault("output_hidden_states", True)
+        kwargs.setdefault("use_cache", False)
+        kwargs.setdefault("return_dict", True)
+        # Compression only reads the hidden states at the appended [MEM] tokens.
+        # Keep logits for those positions instead of materializing full-sequence vocab logits.
+        kwargs.setdefault("logits_to_keep", self.num_latent_tokens)
+        try:
+            return self.model(**kwargs)
+        except TypeError as exc:
+            if "logits_to_keep" not in str(exc):
+                raise
+            kwargs.pop("logits_to_keep", None)
+            return self.model(**kwargs)
+
+    def _forward_kwargs_from_encoding(self, enc, input_ids, attention_mask, dtype):
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        for key in ("pixel_values", "image_grid_thw", "token_type_ids"):
+            if key not in enc:
+                continue
+            value = enc[key]
+            if key == "pixel_values":
+                value = value.to(dtype)
+            elif key == "token_type_ids":
+                value = torch.cat(
+                    [
+                        value,
+                        torch.zeros(
+                            value.shape[0],
+                            self.num_latent_tokens,
+                            device=value.device,
+                            dtype=value.dtype,
+                        ),
+                    ],
+                    dim=1,
+                )
+            kwargs[key] = value
+        return kwargs
+
+    def _collate_processor_encodings(self, encodings: List[dict]):
+        pad_id = self.tokenizer.pad_token_id
+        max_len = max(int(enc["input_ids"].shape[1]) for enc in encodings)
+        out = {}
+
+        for key in encodings[0].keys():
+            values = [enc[key] for enc in encodings if key in enc]
+            if not values:
+                continue
+            if key == "input_ids":
+                padded = []
+                for value in values:
+                    pad_len = max_len - value.shape[1]
+                    padded.append(F.pad(value, (0, pad_len), value=pad_id))
+                out[key] = torch.cat(padded, dim=0)
+            elif key == "attention_mask":
+                padded = []
+                for value in values:
+                    pad_len = max_len - value.shape[1]
+                    padded.append(F.pad(value, (0, pad_len), value=0))
+                out[key] = torch.cat(padded, dim=0)
+            elif key == "token_type_ids":
+                padded = []
+                for value in values:
+                    pad_len = max_len - value.shape[1]
+                    padded.append(F.pad(value, (0, pad_len), value=0))
+                out[key] = torch.cat(padded, dim=0)
+            else:
+                out[key] = torch.cat(values, dim=0)
+        return out
+
     # ------------------------------------------------------------------ gradient checkpointing
 
     def enable_gradient_checkpointing(self):
@@ -490,53 +576,66 @@ class QwenVLCompressor(nn.Module):
                 image_texts = []
                 image_pils = []
                 for i in image_indices:
-                    image_texts.append(
-                        self.processor.apply_chat_template(
-                            [{
-                                "role": "user",
-                                "content": [
-                                    {"type": "image", "image": images[i]},
-                                    {"type": "text", "text": texts[i]},
-                                ],
-                            }],
-                            tokenize=False,
-                            add_generation_prompt=True,
+                    if self.base_model_type == "gemma3":
+                        image_texts.append(f"<start_of_image> {texts[i]}")
+                    else:
+                        image_texts.append(
+                            self.processor.apply_chat_template(
+                                [{
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "image", "image": images[i]},
+                                        {"type": "text", "text": texts[i]},
+                                    ],
+                                }],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
                         )
-                    )
                     image_pils.append(images[i])
 
-                enc = self.processor(
-                    text=image_texts,
-                    images=image_pils,
-                    padding=True,
-                    return_tensors="pt",
-                ).to(device)
+                if self.base_model_type == "gemma3":
+                    enc_items = [
+                        self.processor(
+                            text=image_text,
+                            images=image_pil,
+                            return_tensors="pt",
+                        )
+                        for image_text, image_pil in zip(image_texts, image_pils)
+                    ]
+                    enc = self._collate_processor_encodings(enc_items)
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                else:
+                    enc = self.processor(
+                        text=image_texts,
+                        images=image_pils,
+                        padding=True,
+                        return_tensors="pt",
+                    ).to(device)
+                input_ids = enc["input_ids"]
+                attention_mask = enc["attention_mask"]
                 mem_ids = torch.full(
-                    (enc.input_ids.shape[0], self.num_latent_tokens),
+                    (input_ids.shape[0], self.num_latent_tokens),
                     self.mem_token_id,
                     device=device,
-                    dtype=enc.input_ids.dtype,
+                    dtype=input_ids.dtype,
                 )
-                ids_ext = torch.cat([enc.input_ids, mem_ids], dim=1)
+                ids_ext = torch.cat([input_ids, mem_ids], dim=1)
                 mask_ext = torch.cat(
                     [
-                        enc.attention_mask,
+                        attention_mask,
                         torch.ones(
-                            enc.input_ids.shape[0],
+                            input_ids.shape[0],
                             self.num_latent_tokens,
                             device=device,
-                            dtype=enc.attention_mask.dtype,
+                            dtype=attention_mask.dtype,
                         ),
                     ],
                     dim=1,
                 )
 
-                out = self.model(
-                    input_ids=ids_ext,
-                    pixel_values=enc.pixel_values.to(dtype),
-                    image_grid_thw=enc.image_grid_thw,
-                    attention_mask=mask_ext,
-                    output_hidden_states=True,
+                out = self._compress_forward(
+                    **self._forward_kwargs_from_encoding(enc, ids_ext, mask_ext, dtype)
                 )
                 batch_mem = (
                     out.hidden_states[-1][:, -self.num_latent_tokens :, :].float()
@@ -547,14 +646,17 @@ class QwenVLCompressor(nn.Module):
 
             text_indices = [i for i, img in enumerate(images) if img is None]
             if text_indices:
-                formatted = [
-                    self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": texts[i]}],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for i in text_indices
-                ]
+                if self.base_model_type == "gemma3":
+                    formatted = [texts[i] for i in text_indices]
+                else:
+                    formatted = [
+                        self.tokenizer.apply_chat_template(
+                            [{"role": "user", "content": texts[i]}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                        for i in text_indices
+                    ]
                 enc = self.tokenizer(formatted, padding=True, return_tensors="pt").to(device)
                 mem_ids = torch.full(
                     (enc.input_ids.shape[0], self.num_latent_tokens),
@@ -576,10 +678,29 @@ class QwenVLCompressor(nn.Module):
                     dim=1,
                 )
 
-                out = self.model(
+                extra_kwargs = {}
+                if self.base_model_type == "gemma3":
+                    token_type_ids = enc.get("token_type_ids")
+                    if token_type_ids is None:
+                        token_type_ids = torch.zeros_like(enc.input_ids)
+                    token_type_ids_ext = torch.cat(
+                        [
+                            token_type_ids,
+                            torch.zeros(
+                                enc.input_ids.shape[0],
+                                self.num_latent_tokens,
+                                device=device,
+                                dtype=token_type_ids.dtype,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    extra_kwargs["token_type_ids"] = token_type_ids_ext
+
+                out = self._compress_forward(
                     input_ids=ids_ext,
                     attention_mask=mask_ext,
-                    output_hidden_states=True,
+                    **extra_kwargs,
                 )
                 batch_mem = (
                     out.hidden_states[-1][:, -self.num_latent_tokens :, :].float()

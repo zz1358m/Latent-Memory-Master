@@ -1,0 +1,115 @@
+# ============================================================
+# LLaVA-based Latent Retrieval Configuration
+# Compressor : llava-hf/llava-1.5-7b-hf   (liuhaotian/llava-v1.5-7b)
+# Decoder LM : Llama-3.2-1B-Instruct       (separate text reconstruction model)
+# Generator  : llava-hf/llava-1.5-13b-hf  (liuhaotian/llava-v1.5-13b)
+# ============================================================
+
+model:
+  compressor_name: "llava-hf/llava-1.5-7b-hf"
+  decoder_name:    "meta-llama/Llama-3.2-1B-Instruct"
+  generator_name:  "llava-hf/llava-1.5-13b-hf"
+  dtype: "bfloat16"
+  compressor_hidden: 4096   # Vicuna-7B hidden size
+  decoder_hidden:    2048   # LLaMA-1B hidden size
+  generator_hidden:  5120   # Vicuna-13B hidden size
+
+# ---------------------------------------------------------------------------
+# LoRA (applied to language_model attention layers only)
+# Vision tower + MM projector are frozen
+# ---------------------------------------------------------------------------
+compressor:
+  # Number of learned [MEM] latent tokens per compressed evidence item.
+  # Retrieval averages these tokens; reconstruction/generation consume them in order.
+  num_latent_tokens: 1
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  retrieval_dim: 512
+
+decoder:
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
+
+# ---------------------------------------------------------------------------
+# Image preprocessing — whole image, no segmentation
+# ---------------------------------------------------------------------------
+image:
+  scale: 0.1              # 1/20 per dimension → 1/400 area
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  learning_rate: 1.0e-4
+  batch_size: 8                      # text (WebQA) batch size per step
+  image_batch_size: 8                 # WebQA image batch size per step
+  gradient_accumulation_steps: 2      # effective batch = 16
+  num_epochs: 2
+  warmup_steps: 50
+
+  # Loss weights
+  lambda_recon:           0.5   # text CE reconstruction
+  lambda_contrast:        0.2   # text contrastive
+  lambda_distill:         1.0   # text distill KL (LLaVA-13b teacher sees Evidence N: text)
+  lambda_image_contrast:  0.2   # image contrastive (WebQA)
+  lambda_image_distill:   2.0   # image distill KL (LLaVA-13b teacher sees actual image)
+  lambda_embed_recon:     5.0   # image CLIP CLS MSE recon (MEM → img_embed_decode_proj → CLIP CLS)
+  recon_negatives:        True  # include hard negatives in text sentence reconstruction loss
+  recon_query:            False   # include query CE reconstruction loss (L_recon_query)
+  recon_title:            True   # include image caption CE reconstruction loss (L_recon_title)
+
+  # Contrastive
+  temperature: 0.07
+  max_hard_negatives: 8          # randomly sampled negatives for text contrast
+  max_neg_images: 8              # random negative image regions per WebQA sample
+
+  # Distillation
+  n_distill_tokens: 16
+  student_distill_hard_negatives_max: 0
+
+  # Logging / checkpointing
+  save_dir: "checkpoints/"
+  log_every: 10
+  val_every: 500
+  val_samples: 200          # samples per modality for EM/F1 validation (generation is slow)
+
+# ---------------------------------------------------------------------------
+# Data (WebQA — both image and text modalities)
+# ---------------------------------------------------------------------------
+data:
+  train: "data/webqa_train.json"
+  val:   "data/webqa_val.json"
+  max_samples: -1
+
+# ---------------------------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------------------------
+retrieval:
+  top_k: 5
+  index_type: "flat"
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+generation:
+  max_new_tokens: 64
+
+# ---------------------------------------------------------------------------
+# VisRAG baseline
+# ---------------------------------------------------------------------------
+visrag:
+  top_k_values: [1, 2, 5, 10]
+  retrieval_method: "dense"          # "dense" or "bm25"
+  dense_model: "sentence-transformers/all-MiniLM-L6-v2"
+  nemo_model: "nvidia/llama-nemotron-embed-vl-1b-v2"
+  qwen3vl_model: "Qwen/Qwen3-VL-Embedding-8B"
+  clip_model: "llava-hf/clip-vit-large-patch14-336"
+
+paths:
+  checkpoint: "checkpoints/model.pt"
+  memory_bank: "memory_bank/"
+  results_dir: "results/"

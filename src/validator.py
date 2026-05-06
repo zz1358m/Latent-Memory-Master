@@ -20,7 +20,9 @@ Aggregate metrics returned
 em, f1, rouge_l, avg_tokens, avg_retrieved_sentences
 """
 
+import json
 import logging
+import os
 import random
 from typing import Dict, List
 
@@ -69,6 +71,9 @@ class ValidationRunner:
         device: str = "cuda",
         compress_batch_size: int = 128,
         gen_batch_size: int = 16,
+        dump_examples: int = 0,
+        dump_dir: str = None,
+        dump_name_suffix: str = "",
     ):
         self.autoencoder = autoencoder
         self.generator = generator
@@ -78,6 +83,10 @@ class ValidationRunner:
         self.device = device
         self.compress_batch_size = compress_batch_size
         self.gen_batch_size = gen_batch_size
+        self.dump_examples = max(0, dump_examples)
+        self.dump_dir = dump_dir
+        self.dump_name_suffix = dump_name_suffix
+        self._dump_rows: List[Dict] = []
 
         if self.generator_tokenizer.pad_token is None:
             self.generator_tokenizer.pad_token = self.generator_tokenizer.eos_token
@@ -90,8 +99,8 @@ class ValidationRunner:
         self,
         projected_tokens: torch.Tensor,  # (k, H_gen)
         query: str,
-    ) -> torch.Tensor:
-        """Return input_embeds for one sample as a 1-D sequence (L, H_gen)."""
+    ) -> tuple[torch.Tensor, int, int]:
+        """Return input_embeds plus lengths for no-system and context-only spans."""
         embed = self.generator.get_input_embeddings()
         dtype = next(self.generator.parameters()).dtype
 
@@ -99,13 +108,30 @@ class ValidationRunner:
             return embed(_tok(self.generator_tokenizer, text, self.device)).to(dtype)
 
         prefix_str, suffix_str = _split_chat_template(self.generator_tokenizer, query)
-        parts = [_e(prefix_str)]
+        prefix = _e(prefix_str)
+        parts = [prefix]
+        middle_len = 0
         for i, lat in enumerate(projected_tokens):
             label = f"Latent context {i+1}: " if i == 0 else f"\nLatent context {i+1}: "
-            parts.append(_e(label))
-            parts.append(lat.reshape(-1, lat.shape[-1]).to(dtype).unsqueeze(0))
-        parts.append(_e(suffix_str))
-        return torch.cat(parts, dim=1).squeeze(0)   # (L, H)
+            label_emb = _e(label)
+            lat_emb = lat.reshape(-1, lat.shape[-1]).to(dtype).unsqueeze(0)
+            middle_len += int(label_emb.shape[1] + lat_emb.shape[1])
+            parts.append(label_emb)
+            parts.append(lat_emb)
+        suffix = _e(suffix_str)
+        parts.append(suffix)
+        full = torch.cat(parts, dim=1).squeeze(0)
+        no_system_len = int(full.shape[0] - prefix.shape[1])
+        return full, no_system_len, middle_len
+
+    def _build_prompt_text(self, projected_tokens: torch.Tensor, query: str) -> str:
+        prefix_str, suffix_str = _split_chat_template(self.generator_tokenizer, query)
+        prompt = prefix_str
+        for i in range(projected_tokens.shape[0]):
+            label = f"Latent context {i+1}: [LATENT]" if i == 0 else f"\nLatent context {i+1}: [LATENT]"
+            prompt += label
+        prompt += suffix_str
+        return prompt
 
     def _batch_generate(
         self,
@@ -124,10 +150,13 @@ class ValidationRunner:
         answers : list[str]
         input_lens : list[int]  (real sequence length per sample, for token counting)
         """
-        seq_embeds = [
+        seq_with_meta = [
             self._build_seq_embeds(proj, q)
             for proj, q in zip(projected_list, questions)
         ]
+        seq_embeds = [x[0] for x in seq_with_meta]
+        no_system_lens = [x[1] for x in seq_with_meta]
+        context_only_lens = [x[2] for x in seq_with_meta]
 
         B      = len(seq_embeds)
         max_L  = max(e.shape[0] for e in seq_embeds)
@@ -163,7 +192,7 @@ class ValidationRunner:
             answers.append(
                 self.generator_tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             )
-        return answers, input_lens
+        return answers, input_lens, no_system_lens, context_only_lens
 
     # ------------------------------------------------------------------
     # Public: multi-k evaluation (compress once, generate per k)
@@ -257,9 +286,14 @@ class ValidationRunner:
                 predictions: List[str]       = []
                 references:  List[List[str]] = []
                 token_counts: List[int]      = []
+                token_counts_no_system: List[int] = []
+                token_counts_context_only: List[int] = []
                 retrieved_counts: List[int]  = []
                 recall_scores: List[float]   = []
                 precision_scores: List[float]= []
+                current_dump_rows: List[Dict] = []
+                prompts_for_dump: List[str]  = []
+                retrieved_for_dump: List[List[str]] = []
 
                 # Retrieve on CPU; delay projection to the generation batch
                 top_indices_by_sample: List[torch.Tensor] = []
@@ -282,6 +316,7 @@ class ValidationRunner:
                     retrieved_counts.append(actual_k)
                     ans = s["answers"]
                     references.append(ans if isinstance(ans, list) else [ans])
+                    retrieved_for_dump.append([s["sentences"][j] for j in top_indices.tolist()])
 
                 # Batch generate
                 n_gen_batches = (len(valid) + self.gen_batch_size - 1) // self.gen_batch_size
@@ -293,17 +328,51 @@ class ValidationRunner:
                     for local_idx, (start, end) in enumerate(batch_offsets):
                         top_indices = top_indices_by_sample[b_start + local_idx]
                         top_compressed = all_compressed[start:end][top_indices].to(self.device)
-                        b_proj.append(self.autoencoder.project_for_generator(top_compressed))
+                        proj = self.autoencoder.project_for_generator(top_compressed)
+                        b_proj.append(proj)
+                        prompts_for_dump.append(self._build_prompt_text(proj, b_qs[local_idx]))
                     try:
-                        b_answers, b_lens = self._batch_generate(b_proj, b_qs)
+                        b_answers, b_lens, b_lens_no_system, b_lens_context_only = self._batch_generate(b_proj, b_qs)
                     except Exception as exc:
                         logger.warning(f"Batch generation failed (k={k}): {exc}")
                         b_answers = [""] * len(b_proj)
                         b_lens    = [0]   * len(b_proj)
+                        b_lens_no_system = [0] * len(b_proj)
+                        b_lens_context_only = [0] * len(b_proj)
                     predictions.extend(b_answers)
                     token_counts.extend(b_lens)
+                    token_counts_no_system.extend(b_lens_no_system)
+                    token_counts_context_only.extend(b_lens_context_only)
 
-                metrics = evaluate(predictions, references, token_counts)
+                    if self.dump_examples > 0 and len(current_dump_rows) < self.dump_examples:
+                        batch_samples = valid[b_start: b_start + self.gen_batch_size]
+                        batch_prompts = prompts_for_dump[-len(b_proj):]
+                        batch_retrieved = retrieved_for_dump[b_start: b_start + self.gen_batch_size]
+                        for sample, prompt_text, retrieved, pred, n_tok, n_tok_no_system, n_tok_context_only in zip(
+                            batch_samples, batch_prompts, batch_retrieved, b_answers, b_lens, b_lens_no_system, b_lens_context_only
+                        ):
+                            if len(current_dump_rows) >= self.dump_examples:
+                                break
+                            current_dump_rows.append({
+                                "id": sample.get("id"),
+                                "question": sample.get("question"),
+                                "answers": sample.get("answers", []),
+                                "retrieved_sentences": retrieved,
+                                "prompt": prompt_text,
+                                "prediction": pred,
+                                "input_tokens": n_tok,
+                                "input_tokens_no_system": n_tok_no_system,
+                                "input_tokens_context_only": n_tok_context_only,
+                                "k": k,
+                            })
+
+                metrics = evaluate(
+                    predictions,
+                    references,
+                    token_counts,
+                    token_counts_no_system=token_counts_no_system,
+                    token_counts_context_only=token_counts_context_only,
+                )
                 metrics["avg_retrieved_sentences"] = (
                     sum(retrieved_counts) / len(retrieved_counts)
                 )
@@ -316,6 +385,14 @@ class ValidationRunner:
                     f"Recall@{k}={metrics['recall_at_k']:.4f}"
                 )
                 results[k] = metrics
+
+                if self.dump_examples and self.dump_dir and current_dump_rows:
+                    os.makedirs(self.dump_dir, exist_ok=True)
+                    dump_name = f"latent_debug_examples_k{k}.json" if len(k_list) > 1 else f"latent_debug_examples{self.dump_name_suffix}.json"
+                    dump_path = os.path.join(self.dump_dir, dump_name)
+                    with open(dump_path, "w", encoding="utf-8") as f:
+                        json.dump(current_dump_rows, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Latent debug dump saved to {dump_path}")
 
         if was_training:
             self.autoencoder.train()

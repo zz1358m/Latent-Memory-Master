@@ -18,7 +18,12 @@ import logging
 import os
 import random
 import sys
+
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
 from typing import Dict, List, Optional, Tuple
+from jinja2.exceptions import TemplateError
 
 import torch
 import yaml
@@ -26,17 +31,48 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
 from data.prepare_webqa import load_webqa_samples
 from src.evaluation import evaluate
 from src.distillation import _split_chat_template, _tok
-from src.qwen_compressor import QwenVLCompressor, resolve_qwen_vl_model_class
+from src.gemma_compressor import QwenVLCompressor, resolve_qwen_vl_model_class
 from src.region_encoder import resize_image
+from scripts.internal.baselines import _count_tokens_from_marker, _count_tokens_between_markers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _disable_tqdm_progress() -> None:
+    global tqdm
+    _orig_tqdm = tqdm
+
+    def _quiet_tqdm(*args, **kwargs):
+        kwargs["disable"] = True
+        return _orig_tqdm(*args, **kwargs)
+
+    tqdm = _quiet_tqdm
+
+
+def _simple_tqdm_progress() -> None:
+    global tqdm
+    _orig_tqdm = tqdm
+    visible = {"prep-baselines", "unified-baselines"}
+
+    def _simple_tqdm(*args, **kwargs):
+        if kwargs.get("desc") not in visible:
+            kwargs["disable"] = True
+        return _orig_tqdm(*args, **kwargs)
+
+    tqdm = _simple_tqdm
+
+_SYSTEM_PROMPT = (
+    "You are a helpful assistant. "
+    "Answer the question concisely (a few words or a short phrase) "
+    "based on the provided context."
+)
 
 
 class QwenGenerator:
@@ -44,23 +80,38 @@ class QwenGenerator:
         logger.info(f"Loading Qwen VL generator: {model_name}")
         cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         model_type = getattr(cfg, "model_type", None)
-        if model_type not in {"qwen2_vl", "qwen2_5_vl"}:
+        if model_type not in {"qwen2_vl", "qwen2_5_vl", "gemma3"}:
             raise ValueError(
-                f"scripts/baselines_qwen.py requires a Qwen-VL generator, got "
+                f"scripts/baselines_gemma.py requires a supported multimodal generator, got "
                 f"model_type={model_type} from {model_name}."
             )
         model_cls = resolve_qwen_vl_model_class(model_name)
-        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
             self.processor.tokenizer.padding_side = "left"
         self.model = model_cls.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, device_map=device
+            model_name, torch_dtype=torch.bfloat16, device_map=device, trust_remote_code=True
         )
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+        self.model_type = model_type
+        self.is_gemma3 = model_type == "gemma3"
         self.device = device
         self.max_new_tokens = max_new_tokens
+
+    def _prompt_token_stats(self, prompt: str, image_extra_tokens: int = 0, latent: bool = False) -> Tuple[int, int]:
+        if latent:
+            no_system = _count_tokens_from_marker(self.processor.tokenizer, prompt, ["Latent context 1:"])
+            context_only = _count_tokens_between_markers(
+                self.processor.tokenizer, prompt, ["Latent context 1:"], ["Question:"]
+            )
+        else:
+            no_system = _count_tokens_from_marker(self.processor.tokenizer, prompt, ["Context 1:"])
+            context_only = _count_tokens_between_markers(
+                self.processor.tokenizer, prompt, ["Context 1:"], ["Question:"]
+            )
+        return int(no_system + image_extra_tokens), int(context_only + image_extra_tokens)
 
     def _effective_multimodal_length(self, enc, num_images: int) -> int:
         if num_images <= 0 or "image_grid_thw" not in enc:
@@ -72,7 +123,7 @@ class QwenGenerator:
         merge_tokens = int((grid.prod(dim=-1) // (merge_size ** 2)).sum().item())
         return int(enc["input_ids"].shape[-1]) - int(num_images) + merge_tokens
 
-    def _build_latent_seq_embeds(self, question: str, proj_tokens: torch.Tensor) -> torch.Tensor:
+    def _build_latent_seq_embeds(self, question: str, proj_tokens: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         embed_fn = self.model.get_input_embeddings()
         dtype = next(self.model.parameters()).dtype
         tok = self.processor.tokenizer
@@ -81,13 +132,20 @@ class QwenGenerator:
             return embed_fn(_tok(tok, text, self.device, max_len)).to(dtype)
 
         prefix_str, suffix_str = _split_chat_template(tok, question)
-        parts = [_e(prefix_str)]
+        prefix = _e(prefix_str)
+        parts = [prefix]
+        middle_len = 0
         for i, lat in enumerate(proj_tokens):
             label = f"Latent context {i + 1}: " if i == 0 else f"\nLatent context {i + 1}: "
-            parts.append(_e(label))
-            parts.append(lat.reshape(-1, lat.shape[-1]).to(dtype).unsqueeze(0).to(self.device))
-        parts.append(_e(suffix_str))
-        return torch.cat(parts, dim=1).squeeze(0)
+            label_emb = _e(label)
+            lat_emb = lat.reshape(-1, lat.shape[-1]).to(dtype).unsqueeze(0).to(self.device)
+            middle_len += int(label_emb.shape[1] + lat_emb.shape[1])
+            parts.append(label_emb)
+            parts.append(lat_emb)
+        suffix = _e(suffix_str)
+        parts.append(suffix)
+        full = torch.cat(parts, dim=1).squeeze(0)
+        return full, int(full.shape[0] - prefix.shape[1]), middle_len
 
     def _build_evidence_prompt(self, question: str, evidences: List[Dict]) -> Tuple[str, List[Image.Image]]:
         # Align raw-evidence prompting with the teacher-side wording/order used in
@@ -103,8 +161,21 @@ class QwenGenerator:
             else:
                 content.append({"type": "text", "text": f"Context {i + 1}: {ev['text']}\n"})
         content.append({"type": "text", "text": f"Question: {question}"})
-        messages = [{"role": "user", "content": content}]
-        prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if self.is_gemma3:
+            messages = [{"role": "user", "content": [{"type": "text", "text": f"{_SYSTEM_PROMPT}\n\n"}] + content}]
+            prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return prompt, images
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+        try:
+            prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except TemplateError as exc:
+            if "System role not supported" not in str(exc):
+                raise
+            messages = [{"role": "user", "content": [{"type": "text", "text": f"{_SYSTEM_PROMPT}\n\n"}] + content}]
+            prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return prompt, images
 
     def build_latent_prompt_text(self, question: str, proj_tokens: torch.Tensor) -> str:
@@ -124,9 +195,10 @@ class QwenGenerator:
         return prompt
 
     @torch.no_grad()
-    def generate_with_latents(self, question: str, proj_tokens: torch.Tensor) -> Tuple[str, int]:
+    def generate_with_latents(self, question: str, proj_tokens: torch.Tensor) -> Tuple[str, int, int, int]:
         tok = self.processor.tokenizer
-        input_embeds = self._build_latent_seq_embeds(question, proj_tokens).unsqueeze(0)
+        seq, n_no_system, n_context_only = self._build_latent_seq_embeds(question, proj_tokens)
+        input_embeds = seq.unsqueeze(0)
         seq_len = input_embeds.shape[1]
         out = self.model.generate(
             inputs_embeds=input_embeds,
@@ -136,34 +208,63 @@ class QwenGenerator:
             pad_token_id=tok.eos_token_id,
         )
         gen_ids = out[0, seq_len:] if out.shape[1] > seq_len else out[0]
-        return tok.decode(gen_ids, skip_special_tokens=True).strip(), seq_len
+        return tok.decode(gen_ids, skip_special_tokens=True).strip(), seq_len, n_no_system, n_context_only
 
     @torch.no_grad()
-    def generate_with_evidence(self, question: str, evidences: List[Dict]) -> Tuple[str, int]:
+    def count_with_latents(self, question: str, proj_tokens: torch.Tensor) -> Tuple[int, int, int]:
+        seq, n_no_system, n_context_only = self._build_latent_seq_embeds(question, proj_tokens)
+        return int(seq.shape[0]), int(n_no_system), int(n_context_only)
+
+    @torch.no_grad()
+    def generate_with_evidence(self, question: str, evidences: List[Dict]) -> Tuple[str, int, int, int]:
         if not evidences:
-            return "", 0
+            return "", 0, 0, 0
         prompt, images = self._build_evidence_prompt(question, evidences)
         if images:
             enc = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
         else:
             enc = self.processor(text=prompt, return_tensors="pt").to(self.device)
         n_in = self._effective_multimodal_length(enc, len(images))
+        raw_prompt_len = int(enc["input_ids"].shape[-1])
+        image_extra_tokens = max(0, n_in - raw_prompt_len)
+        n_no_system, n_context_only = self._prompt_token_stats(
+            prompt, image_extra_tokens=image_extra_tokens, latent=False
+        )
         out = self.model.generate(
             **enc,
             max_new_tokens=self.max_new_tokens,
             do_sample=False,
             pad_token_id=self.processor.tokenizer.eos_token_id,
         )
-        raw_prompt_len = enc["input_ids"].shape[-1]
         gen_ids = out[0, raw_prompt_len:] if out.shape[1] > raw_prompt_len else out[0]
-        return self.processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip(), n_in
+        return self.processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip(), n_in, n_no_system, n_context_only
 
     @torch.no_grad()
-    def batch_generate_with_latents(self, questions: List[str], projected_list: List[torch.Tensor]) -> Tuple[List[str], List[int]]:
+    def count_with_evidence(self, question: str, evidences: List[Dict]) -> Tuple[int, int, int]:
+        if not evidences:
+            return 0, 0, 0
+        prompt, images = self._build_evidence_prompt(question, evidences)
+        if images:
+            enc = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
+        else:
+            enc = self.processor(text=prompt, return_tensors="pt").to(self.device)
+        n_in = self._effective_multimodal_length(enc, len(images))
+        raw_prompt_len = int(enc["input_ids"].shape[-1])
+        image_extra_tokens = max(0, n_in - raw_prompt_len)
+        n_no_system, n_context_only = self._prompt_token_stats(
+            prompt, image_extra_tokens=image_extra_tokens, latent=False
+        )
+        return int(n_in), int(n_no_system), int(n_context_only)
+
+    @torch.no_grad()
+    def batch_generate_with_latents(self, questions: List[str], projected_list: List[torch.Tensor]) -> Tuple[List[str], List[int], List[int], List[int]]:
         if not projected_list:
-            return [], []
+            return [], [], [], []
         tok = self.processor.tokenizer
-        seq_embeds = [self._build_latent_seq_embeds(q, proj) for q, proj in zip(questions, projected_list)]
+        seq_meta = [self._build_latent_seq_embeds(q, proj) for q, proj in zip(questions, projected_list)]
+        seq_embeds = [x[0] for x in seq_meta]
+        no_system_lens = [x[1] for x in seq_meta]
+        context_only_lens = [x[2] for x in seq_meta]
         batch_size = len(seq_embeds)
         max_len = max(e.shape[0] for e in seq_embeds)
         hidden = seq_embeds[0].shape[-1]
@@ -189,24 +290,32 @@ class QwenGenerator:
         for i in range(batch_size):
             gen_ids = out[i, max_len:] if out.shape[1] > max_len else out[i]
             answers.append(tok.decode(gen_ids, skip_special_tokens=True).strip())
-        return answers, lengths
+        return answers, lengths, no_system_lens, context_only_lens
 
     @torch.no_grad()
-    def batch_generate_with_evidence(self, questions: List[str], evidences_batch: List[List[Dict]]) -> Tuple[List[str], List[int]]:
+    def batch_generate_with_evidence(self, questions: List[str], evidences_batch: List[List[Dict]]) -> Tuple[List[str], List[int], List[int], List[int]]:
         if not evidences_batch:
-            return [], []
+            return [], [], [], []
         prompts, images_batch = zip(*(self._build_evidence_prompt(q, evs) for q, evs in zip(questions, evidences_batch)))
         has_any_images = any(len(imgs) > 0 for imgs in images_batch)
         if has_any_images:
-            answers, lengths = [], []
+            answers, lengths, no_system_lens, context_only_lens = [], [], [], []
             for q, evs in zip(questions, evidences_batch):
-                ans, n_tok = self.generate_with_evidence(q, evs)
+                ans, n_tok, n_no_system, n_context_only = self.generate_with_evidence(q, evs)
                 answers.append(ans)
                 lengths.append(n_tok)
-            return answers, lengths
+                no_system_lens.append(n_no_system)
+                context_only_lens.append(n_context_only)
+            return answers, lengths, no_system_lens, context_only_lens
         try:
             enc = self.processor(text=list(prompts), padding=True, return_tensors="pt").to(self.device)
             lengths = enc["attention_mask"].sum(dim=1).tolist()
+            no_system_lens = []
+            context_only_lens = []
+            for prompt, length in zip(prompts, lengths):
+                n_no_system, n_context_only = self._prompt_token_stats(prompt, image_extra_tokens=0, latent=False)
+                no_system_lens.append(n_no_system)
+                context_only_lens.append(n_context_only)
             out = self.model.generate(
                 **enc,
                 max_new_tokens=self.max_new_tokens,
@@ -218,15 +327,17 @@ class QwenGenerator:
             for i in range(len(prompts)):
                 gen_ids = out[i, max_raw_len:] if out.shape[1] > max_raw_len else out[i]
                 answers.append(self.processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
-            return answers, [int(x) for x in lengths]
+            return answers, [int(x) for x in lengths], no_system_lens, context_only_lens
         except Exception as exc:
             logger.warning(f"Batch evidence generation failed, falling back to serial: {exc}")
-            answers, lengths = [], []
+            answers, lengths, no_system_lens, context_only_lens = [], [], [], []
             for q, evs in zip(questions, evidences_batch):
-                ans, n_tok = self.generate_with_evidence(q, evs)
+                ans, n_tok, n_no_system, n_context_only = self.generate_with_evidence(q, evs)
                 answers.append(ans)
                 lengths.append(n_tok)
-            return answers, lengths
+                no_system_lens.append(n_no_system)
+                context_only_lens.append(n_context_only)
+            return answers, lengths, no_system_lens, context_only_lens
 
 
 def _bm25_retrieve(corpus: List[str], query: str, top_k: int) -> List[int]:
@@ -239,11 +350,95 @@ def _bm25_retrieve(corpus: List[str], query: str, top_k: int) -> List[int]:
 
 
 def _dense_retrieve(corpus: List[str], query: str, top_k: int, encoder) -> List[int]:
-    doc_embs = encoder.encode(corpus, convert_to_tensor=True, normalize_embeddings=True)
-    q_emb = encoder.encode([query], convert_to_tensor=True, normalize_embeddings=True)
+    doc_embs = encoder.encode(
+        corpus, convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False
+    )
+    q_emb = encoder.encode(
+        [query], convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False
+    )
     scores = (doc_embs @ q_emb.T).squeeze(-1).cpu().numpy()
     k = min(top_k, len(corpus))
     return list(map(int, (-scores).argsort()[:k]))
+
+
+def _nemo_multimodal_retrieve(candidates: List[Dict], query: str, top_k: int, encoder) -> List[int]:
+    text_pairs = [(idx, c["text"]) for idx, c in enumerate(candidates) if c["kind"] == "text"]
+    image_pairs = [
+        (idx, c["image"], c.get("title", ""))
+        for idx, c in enumerate(candidates)
+        if c["kind"] == "image"
+    ]
+    if not text_pairs and not image_pairs:
+        return []
+
+    emb_chunks = []
+    global_indices = []
+    if text_pairs:
+        emb_chunks.append(encoder.encode_document(
+            [text for _, text in text_pairs],
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ))
+        global_indices.extend(idx for idx, _ in text_pairs)
+    if image_pairs:
+        image_docs = [
+            {"image": img, "text": title}
+            for _, img, title in image_pairs
+        ]
+        emb_chunks.append(encoder.encode(
+            image_docs,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ))
+        global_indices.extend(idx for idx, _, _ in image_pairs)
+
+    doc_embs = torch.cat(emb_chunks, dim=0).float()
+    q_emb = encoder.encode_query(
+        [query],
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).float()
+    scores = (doc_embs @ q_emb.T).squeeze(-1).cpu().numpy()
+    k = min(top_k, len(global_indices))
+    local_top = list(map(int, (-scores).argsort()[:k]))
+    return [global_indices[i] for i in local_top]
+
+
+_QWEN3VL_QUERY_PROMPT = "Retrieve relevant documents for the query."
+
+
+def _qwen3vl_multimodal_retrieve(candidates: List[Dict], query: str, top_k: int, encoder) -> List[int]:
+    documents = []
+    global_indices = []
+    for idx, c in enumerate(candidates):
+        if c["kind"] == "text":
+            documents.append(c["text"])
+            global_indices.append(idx)
+        elif c["kind"] == "image":
+            documents.append({"image": c["image"], "text": c.get("title", "")})
+            global_indices.append(idx)
+    if not documents:
+        return []
+
+    q_emb = encoder.encode(
+        [query],
+        prompt=_QWEN3VL_QUERY_PROMPT,
+        convert_to_tensor=True,
+        show_progress_bar=False,
+    )
+    doc_embs = encoder.encode(documents, convert_to_tensor=True, show_progress_bar=False)
+    if hasattr(encoder, "similarity"):
+        scores = encoder.similarity(q_emb, doc_embs).squeeze(0).float().cpu().numpy()
+    else:
+        q_emb = torch.nn.functional.normalize(q_emb.float(), dim=-1)
+        doc_embs = torch.nn.functional.normalize(doc_embs.float(), dim=-1)
+        scores = (doc_embs @ q_emb.T).squeeze(-1).cpu().numpy()
+    k = min(top_k, len(global_indices))
+    local_top = list(map(int, (-scores).argsort()[:k]))
+    return [global_indices[i] for i in local_top]
 
 
 def _prepare_eval_pool(samples: List[Dict], max_samples: int) -> List[Dict]:
@@ -368,8 +563,10 @@ def _eval_sample(
     top_k: int,
     method: str,
     dense_encoder=None,
+    nemo_encoder=None,
+    qwen3vl_encoder=None,
     compressor: Optional[QwenVLCompressor] = None,
-) -> Optional[Tuple[str, List[str], float, int]]:
+) -> Optional[Tuple[str, List[str], float, int, int, int]]:
     question = prepared["question"]
     answers = prepared["answers"]
     full_context_candidates = prepared["full_context_candidates"]
@@ -378,25 +575,19 @@ def _eval_sample(
     full_pos_indices = set(prepared["full_pos_indices"])
 
     if method == "full_context":
-        pred, n_tok = generator.generate_with_evidence(question, full_context_candidates)
+        pred, n_tok, n_tok_no_system, n_tok_context_only = generator.generate_with_evidence(question, full_context_candidates)
         recall = 1.0 if full_pos_indices else 0.0
-        return pred, answers, recall, n_tok
+        return pred, answers, recall, n_tok, n_tok_no_system, n_tok_context_only
 
     if method == "latent":
         if compressor is None:
             raise ValueError("latent baseline requires a Qwen compressor checkpoint")
-        text_items = [c for c in candidates if c["kind"] == "text"]
-        image_items = [c for c in candidates if c["kind"] == "image"]
+        image_indices = [idx for idx, c in enumerate(candidates) if c["kind"] == "image"]
+        text_indices = [idx for idx, c in enumerate(candidates) if c["kind"] == "text"]
+        latent_candidate_indices = image_indices + text_indices
+        image_items = [candidates[idx] for idx in image_indices]
+        text_items = [candidates[idx] for idx in text_indices]
         latent_chunks = []
-        emb_chunks = []
-        item_order = []
-        if text_items:
-            text_latents = compressor.compress_batch(
-                [c["text"] for c in text_items], with_grad=False, adapter="compress"
-            )
-            latent_chunks.append(text_latents)
-            emb_chunks.append(compressor.get_retrieval_embedding(text_latents))
-            item_order.extend(text_items)
         if image_items:
             img_latents = compressor.compress_batch(
                 [c["title"] for c in image_items],
@@ -405,30 +596,40 @@ def _eval_sample(
                 adapter="compress",
             )
             latent_chunks.append(img_latents)
-            emb_chunks.append(compressor.get_retrieval_embedding(img_latents))
-            item_order.extend(image_items)
+        if text_items:
+            text_latents = compressor.compress_batch(
+                [c["text"] for c in text_items], with_grad=False, adapter="compress"
+            )
+            latent_chunks.append(text_latents)
         cand_latents = torch.cat(latent_chunks, dim=0)
-        cand_embs = torch.cat(emb_chunks, dim=0)
         q_lat = compressor.embed_query_batch([question], with_grad=False)
         q_emb = compressor.get_retrieval_embedding(q_lat)
+        cand_embs = compressor.get_retrieval_embedding(cand_latents)
         sims = (cand_embs @ q_emb.T).squeeze(-1)
-        k = min(top_k, len(item_order))
-        top_i = torch.topk(sims, k=k).indices.tolist()
+        k = min(top_k, len(latent_candidate_indices))
+        local_top_i = torch.topk(sims, k=k).indices.tolist()
+        top_i = [latent_candidate_indices[i] for i in local_top_i]
         recall = len(set(top_i) & pos_indices) / len(pos_indices) if pos_indices else 0.0
-        pred, n_tok = generator.generate_with_latents(question, compressor.project_for_generator(cand_latents[top_i]))
-        return pred, answers, recall, n_tok
+        pred, n_tok, n_tok_no_system, n_tok_context_only = generator.generate_with_latents(
+            question, compressor.project_for_generator(cand_latents[local_top_i])
+        )
+        return pred, answers, recall, n_tok, n_tok_no_system, n_tok_context_only
 
     search_corpus = [c["search_text"] for c in candidates]
     if method == "bm25":
         top_i = _bm25_retrieve(search_corpus, question, top_k)
     elif method == "dense":
         top_i = _dense_retrieve(search_corpus, question, top_k, dense_encoder)
+    elif method == "nemo":
+        top_i = _nemo_multimodal_retrieve(candidates, question, top_k, nemo_encoder)
+    elif method == "qwen3vl":
+        top_i = _qwen3vl_multimodal_retrieve(candidates, question, top_k, qwen3vl_encoder)
     else:
         raise ValueError(f"Unsupported method: {method}")
 
     recall = len(set(top_i) & pos_indices) / len(pos_indices) if pos_indices else 0.0
-    pred, n_tok = generator.generate_with_evidence(question, [candidates[i] for i in top_i])
-    return pred, answers, recall, n_tok
+    pred, n_tok, n_tok_no_system, n_tok_context_only = generator.generate_with_evidence(question, [candidates[i] for i in top_i])
+    return pred, answers, recall, n_tok, n_tok_no_system, n_tok_context_only
 
 
 def run_unified_baselines(
@@ -440,6 +641,8 @@ def run_unified_baselines(
     methods: List[str],
     dense_model_name: str,
     dense_encoder=None,
+    nemo_encoder=None,
+    qwen3vl_encoder=None,
     pool: Optional[List[Dict]] = None,
     compressor: Optional[QwenVLCompressor] = None,
 ) -> Dict[str, Dict]:
@@ -456,20 +659,25 @@ def run_unified_baselines(
         if prepared is not None:
             prepared_pool.append(prepared)
 
-    acc = {m: {"preds": [], "refs": [], "recalls": [], "tokens": [], "mods": [], "meta": []} for m in methods}
+    acc = {m: {"preds": [], "refs": [], "recalls": [], "tokens": [], "tokens_no_system": [], "tokens_context_only": [], "mods": [], "meta": []} for m in methods}
     for s in tqdm(prepared_pool, desc="unified-baselines", leave=False):
         for method in methods:
             result = _eval_sample(
                 s, generator, top_k, method,
-                dense_encoder=dense_encoder, compressor=compressor,
+                dense_encoder=dense_encoder,
+                nemo_encoder=nemo_encoder,
+                qwen3vl_encoder=qwen3vl_encoder,
+                compressor=compressor,
             )
             if result is None:
                 continue
-            pred, refs, recall, n_tok = result
+            pred, refs, recall, n_tok, n_tok_no_system, n_tok_context_only = result
             acc[method]["preds"].append(pred)
             acc[method]["refs"].append(refs)
             acc[method]["recalls"].append(recall)
             acc[method]["tokens"].append(n_tok)
+            acc[method]["tokens_no_system"].append(n_tok_no_system)
+            acc[method]["tokens_context_only"].append(n_tok_context_only)
             acc[method]["mods"].append(s["modality"])
             acc[method]["meta"].append({
                 "source": s.get("source", "webqa"),
@@ -484,12 +692,14 @@ def run_unified_baselines(
         refs = acc[method]["refs"]
         recalls = acc[method]["recalls"]
         tokens = acc[method]["tokens"]
+        tokens_no_system = acc[method]["tokens_no_system"]
+        tokens_context_only = acc[method]["tokens_context_only"]
         mods = acc[method]["mods"]
         meta = acc[method]["meta"]
         if not preds:
             results[method] = {}
             continue
-        m = evaluate(preds, refs, tokens, sample_metadata=meta)
+        m = evaluate(preds, refs, tokens, token_counts_no_system=tokens_no_system, token_counts_context_only=tokens_context_only, sample_metadata=meta)
         m["recall_at_k"] = sum(recalls) / len(recalls) if recalls else 0.0
         m["n"] = len(preds)
         img_preds = [p for p, mod in zip(preds, mods) if mod == "image"]
@@ -520,11 +730,13 @@ def _finalize_method_metrics(acc: Dict[str, List]) -> Dict[str, float]:
     recalls = acc["recalls"]
     precisions = acc["precisions"]
     tokens = acc["tokens"]
+    tokens_no_system = acc.get("tokens_no_system", [])
+    tokens_context_only = acc.get("tokens_context_only", [])
     mods = acc["mods"]
     meta = acc["meta"]
     if not preds:
         return {}
-    m = evaluate(preds, refs, tokens, sample_metadata=meta)
+    m = evaluate(preds, refs, tokens, token_counts_no_system=tokens_no_system, token_counts_context_only=tokens_context_only, sample_metadata=meta)
     m["recall_at_k"] = sum(recalls) / len(recalls) if recalls else 0.0
     m["precision_at_k"] = sum(precisions) / len(precisions) if precisions else 0.0
     m["n"] = len(preds)
@@ -538,6 +750,10 @@ def _finalize_method_metrics(acc: Dict[str, List]) -> Dict[str, float]:
     txt_precisions = [v for v, mod in zip(precisions, mods) if mod == "text"]
     img_tokens = [v for v, mod in zip(tokens, mods) if mod == "image"]
     txt_tokens = [v for v, mod in zip(tokens, mods) if mod == "text"]
+    img_tokens_no_system = [v for v, mod in zip(tokens_no_system, mods) if mod == "image"]
+    txt_tokens_no_system = [v for v, mod in zip(tokens_no_system, mods) if mod == "text"]
+    img_tokens_context_only = [v for v, mod in zip(tokens_context_only, mods) if mod == "image"]
+    txt_tokens_context_only = [v for v, mod in zip(tokens_context_only, mods) if mod == "text"]
     img_meta = [mm for mm, mod in zip(meta, mods) if mod == "image"]
     txt_meta = [mm for mm, mod in zip(meta, mods) if mod == "text"]
     img_metrics = evaluate(img_preds, img_refs, [0] * len(img_preds), sample_metadata=img_meta) if img_preds else {"em": 0.0, "f1": 0.0}
@@ -558,6 +774,38 @@ def _finalize_method_metrics(acc: Dict[str, List]) -> Dict[str, float]:
     m["txt_precision_at_k"] = sum(txt_precisions) / len(txt_precisions) if txt_precisions else 0.0
     m["img_avg_tokens"] = sum(img_tokens) / len(img_tokens) if img_tokens else 0.0
     m["txt_avg_tokens"] = sum(txt_tokens) / len(txt_tokens) if txt_tokens else 0.0
+    m["img_avg_tokens_no_system"] = sum(img_tokens_no_system) / len(img_tokens_no_system) if img_tokens_no_system else 0.0
+    m["txt_avg_tokens_no_system"] = sum(txt_tokens_no_system) / len(txt_tokens_no_system) if txt_tokens_no_system else 0.0
+    m["img_avg_tokens_context_only"] = sum(img_tokens_context_only) / len(img_tokens_context_only) if img_tokens_context_only else 0.0
+    m["txt_avg_tokens_context_only"] = sum(txt_tokens_context_only) / len(txt_tokens_context_only) if txt_tokens_context_only else 0.0
+    return m
+
+
+def _finalize_token_only_metrics(acc: Dict[str, List]) -> Dict[str, float]:
+    tokens = acc["tokens"]
+    tokens_no_system = acc.get("tokens_no_system", [])
+    tokens_context_only = acc.get("tokens_context_only", [])
+    mods = acc["mods"]
+    if not tokens:
+        return {}
+    m = {
+        "avg_tokens": sum(tokens) / len(tokens),
+        "avg_tokens_no_system": sum(tokens_no_system) / len(tokens_no_system) if tokens_no_system else 0.0,
+        "avg_tokens_context_only": sum(tokens_context_only) / len(tokens_context_only) if tokens_context_only else 0.0,
+        "n": len(tokens),
+    }
+    img_tokens = [v for v, mod in zip(tokens, mods) if mod == "image"]
+    txt_tokens = [v for v, mod in zip(tokens, mods) if mod == "text"]
+    img_tokens_no_system = [v for v, mod in zip(tokens_no_system, mods) if mod == "image"]
+    txt_tokens_no_system = [v for v, mod in zip(tokens_no_system, mods) if mod == "text"]
+    img_tokens_context_only = [v for v, mod in zip(tokens_context_only, mods) if mod == "image"]
+    txt_tokens_context_only = [v for v, mod in zip(tokens_context_only, mods) if mod == "text"]
+    m["img_avg_tokens"] = sum(img_tokens) / len(img_tokens) if img_tokens else 0.0
+    m["txt_avg_tokens"] = sum(txt_tokens) / len(txt_tokens) if txt_tokens else 0.0
+    m["img_avg_tokens_no_system"] = sum(img_tokens_no_system) / len(img_tokens_no_system) if img_tokens_no_system else 0.0
+    m["txt_avg_tokens_no_system"] = sum(txt_tokens_no_system) / len(txt_tokens_no_system) if txt_tokens_no_system else 0.0
+    m["img_avg_tokens_context_only"] = sum(img_tokens_context_only) / len(img_tokens_context_only) if img_tokens_context_only else 0.0
+    m["txt_avg_tokens_context_only"] = sum(txt_tokens_context_only) / len(txt_tokens_context_only) if txt_tokens_context_only else 0.0
     return m
 
 
@@ -570,11 +818,15 @@ def run_unified_baselines_multik(
     methods: List[str],
     dense_model_name: str,
     dense_encoder=None,
+    nemo_encoder=None,
+    qwen3vl_encoder=None,
     pool: Optional[List[Dict]] = None,
     compressor: Optional[QwenVLCompressor] = None,
     gen_batch_size: int = 8,
     latent_query_batch_size: int = 128,
+    latent_candidate_batch_size: int = 4,
     dump_examples: int = 0,
+    token_count_only: bool = False,
 ) -> Dict[str, Dict]:
     if not methods:
         return {}
@@ -599,7 +851,7 @@ def run_unified_baselines_multik(
         else:
             method_keys.extend([f"{method}_k{k}" for k in top_k_values])
     acc = {
-        key: {"preds": [], "refs": [], "recalls": [], "precisions": [], "tokens": [], "mods": [], "meta": []}
+        key: {"preds": [], "refs": [], "recalls": [], "precisions": [], "tokens": [], "tokens_no_system": [], "tokens_context_only": [], "mods": [], "meta": []}
         for key in method_keys
     }
     pending = {key: [] for key in method_keys}
@@ -669,39 +921,48 @@ def run_unified_baselines_multik(
         if "dense" in methods:
             search_corpus = [c["search_text"] for c in candidates]
             ranked_indices["dense"] = _dense_retrieve(search_corpus, question, max_k, dense_encoder)
+        if "nemo" in methods:
+            ranked_indices["nemo"] = _nemo_multimodal_retrieve(candidates, question, max_k, nemo_encoder)
+        if "qwen3vl" in methods:
+            ranked_indices["qwen3vl"] = _qwen3vl_multimodal_retrieve(candidates, question, max_k, qwen3vl_encoder)
 
         latent_projected = None
         latent_ranked = None
         if "latent" in methods:
             if compressor is None:
                 raise ValueError("latent baseline requires a Qwen compressor checkpoint")
-            text_items = [c for c in candidates if c["kind"] == "text"]
-            image_items = [c for c in candidates if c["kind"] == "image"]
+            image_indices = [idx for idx, c in enumerate(candidates) if c["kind"] == "image"]
+            text_indices = [idx for idx, c in enumerate(candidates) if c["kind"] == "text"]
+            latent_candidate_indices = image_indices + text_indices
+            image_items = [candidates[idx] for idx in image_indices]
+            text_items = [candidates[idx] for idx in text_indices]
             latent_chunks = []
-            emb_chunks = []
-            item_order = []
-            if text_items:
-                text_latents = compressor.compress_batch(
-                    [c["text"] for c in text_items], with_grad=False, adapter="compress"
-                )
-                latent_chunks.append(text_latents)
-                emb_chunks.append(compressor.get_retrieval_embedding(text_latents))
-                item_order.extend(text_items)
             if image_items:
-                img_latents = compressor.compress_batch(
-                    [c["title"] for c in image_items],
-                    images=[c["image"] for c in image_items],
-                    with_grad=False,
-                    adapter="compress",
-                )
-                latent_chunks.append(img_latents)
-                emb_chunks.append(compressor.get_retrieval_embedding(img_latents))
-                item_order.extend(image_items)
+                img_latent_chunks = []
+                for start in range(0, len(image_items), latent_candidate_batch_size):
+                    chunk = image_items[start: start + latent_candidate_batch_size]
+                    img_latent_chunks.append(compressor.compress_batch(
+                        [c["title"] for c in chunk],
+                        images=[c["image"] for c in chunk],
+                        with_grad=False,
+                        adapter="compress",
+                    ))
+                latent_chunks.append(torch.cat(img_latent_chunks, dim=0))
+            if text_items:
+                text_latent_chunks = []
+                for start in range(0, len(text_items), latent_candidate_batch_size):
+                    chunk = text_items[start: start + latent_candidate_batch_size]
+                    text_latent_chunks.append(compressor.compress_batch(
+                        [c["text"] for c in chunk], with_grad=False, adapter="compress"
+                    ))
+                latent_chunks.append(torch.cat(text_latent_chunks, dim=0))
             cand_latents = torch.cat(latent_chunks, dim=0)
-            cand_embs = torch.cat(emb_chunks, dim=0)
+            cand_embs = compressor.get_retrieval_embedding(cand_latents)
             q_emb = latent_q_embs[sample_idx]
             sims = (cand_embs @ q_emb.unsqueeze(-1)).squeeze(-1)
-            latent_ranked = torch.topk(sims, k=min(max_k, len(item_order))).indices.tolist()
+            latent_ranked = torch.topk(
+                sims, k=min(max_k, cand_latents.shape[0])
+            ).indices.tolist()
             latent_projected = compressor.project_for_generator(cand_latents)
 
         for method in methods:
@@ -710,7 +971,8 @@ def run_unified_baselines_multik(
             for k in top_k_values:
                 key = f"{method}_k{k}"
                 if method == "latent":
-                    top_i = latent_ranked[: min(k, len(latent_ranked))]
+                    local_top_i = latent_ranked[: min(k, len(latent_ranked))]
+                    top_i = [latent_candidate_indices[i] for i in local_top_i]
                     hits = len(set(top_i) & pos_indices)
                     recall = hits / len(pos_indices) if pos_indices else 0.0
                     precision = hits / len(top_i) if top_i else 0.0
@@ -718,7 +980,7 @@ def run_unified_baselines_multik(
                         "mode": "latent",
                         "sample_id": s.get("id"),
                         "question": question,
-                        "payload": latent_projected[top_i],
+                        "payload": latent_projected[local_top_i],
                         "refs": answers,
                         "recall": recall,
                         "precision": precision,
@@ -739,7 +1001,7 @@ def run_unified_baselines_multik(
                             "answers": answers,
                             "retrieved_indices": top_i,
                             "retrieved": _serialize_evidences([candidates[i] for i in top_i]),
-                            "prompt": generator.build_latent_prompt_text(question, latent_projected[top_i]),
+                            "prompt": generator.build_latent_prompt_text(question, latent_projected[local_top_i]),
                         })
                 else:
                     top_i = ranked_indices[method][: min(k, len(ranked_indices[method]))]
@@ -778,23 +1040,41 @@ def run_unified_baselines_multik(
     for key, items in pending.items():
         if not items:
             continue
+        if token_count_only:
+            for item in tqdm(items, desc=f"tok-{key}", leave=False):
+                if item["mode"] == "latent":
+                    n_tok, n_tok_no_system, n_tok_context_only = generator.count_with_latents(
+                        item["question"], item["payload"]
+                    )
+                else:
+                    n_tok, n_tok_no_system, n_tok_context_only = generator.count_with_evidence(
+                        item["question"], item["payload"]
+                    )
+                acc[key]["tokens"].append(n_tok)
+                acc[key]["tokens_no_system"].append(n_tok_no_system)
+                acc[key]["tokens_context_only"].append(n_tok_context_only)
+                acc[key]["mods"].append(item["modality"])
+                acc[key]["meta"].append(item["meta"])
+            continue
         for start in tqdm(range(0, len(items), gen_batch_size), desc=f"gen-{key}", leave=False):
             chunk = items[start: start + gen_batch_size]
             questions = [it["question"] for it in chunk]
             if chunk[0]["mode"] == "latent":
-                answers, lengths = generator.batch_generate_with_latents(
+                answers, lengths, lengths_no_system, lengths_context_only = generator.batch_generate_with_latents(
                     questions, [it["payload"] for it in chunk]
                 )
             else:
-                answers, lengths = generator.batch_generate_with_evidence(
+                answers, lengths, lengths_no_system, lengths_context_only = generator.batch_generate_with_evidence(
                     questions, [it["payload"] for it in chunk]
                 )
-            for ans, n_tok, item in zip(answers, lengths, chunk):
+            for ans, n_tok, n_tok_no_system, n_tok_context_only, item in zip(answers, lengths, lengths_no_system, lengths_context_only, chunk):
                 acc[key]["preds"].append(ans)
                 acc[key]["refs"].append(item["refs"])
                 acc[key]["recalls"].append(item["recall"])
                 acc[key]["precisions"].append(item["precision"])
                 acc[key]["tokens"].append(n_tok)
+                acc[key]["tokens_no_system"].append(n_tok_no_system)
+                acc[key]["tokens_context_only"].append(n_tok_context_only)
                 acc[key]["mods"].append(item["modality"])
                 acc[key]["meta"].append(item["meta"])
             if dump_examples > 0 and dumped.get(key):
@@ -804,7 +1084,8 @@ def run_unified_baselines_multik(
                     if global_idx < len(dumped[key]):
                         dumped[key][global_idx]["prediction"] = ans
 
-    results = {key: _finalize_method_metrics(val) for key, val in acc.items()}
+    finalizer = _finalize_token_only_metrics if token_count_only else _finalize_method_metrics
+    results = {key: finalizer(val) for key, val in acc.items()}
     return results, dumped
 
 
@@ -881,16 +1162,44 @@ def _print_results_report(results: Dict[str, Dict]) -> None:
         )
 
 
+def _print_token_only_report(results: Dict[str, Dict]) -> None:
+    if not results:
+        print("No token results.")
+        return
+    print("\nToken Counts")
+    print("method avg_tokens avg_tokens_no_system avg_tokens_context_only n")
+    for method, metrics in results.items():
+        if not metrics:
+            print(f"{method} empty")
+            continue
+        print(
+            " ".join([
+                method,
+                _fmt_metric(metrics, "avg_tokens"),
+                _fmt_metric(metrics, "avg_tokens_no_system"),
+                _fmt_metric(metrics, "avg_tokens_context_only"),
+                str(metrics.get("n", "NA")),
+            ])
+        )
+
+
 def main(args):
+    if args.disable_tqdm:
+        _disable_tqdm_progress()
+    elif args.simple_tqdm:
+        _simple_tqdm_progress()
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_cfg = cfg["model"]
     scale = cfg.get("image", {}).get("scale", 0.1)
-    gen_name = model_cfg["generator_name"]
+    gen_name = args.generator_model or model_cfg["generator_name"]
     max_new_tokens = cfg.get("generation", {}).get("max_new_tokens", 64)
     dense_model = cfg.get("visrag", {}).get("dense_model", "sentence-transformers/all-MiniLM-L6-v2")
+    nemo_model = args.nemo_model or cfg.get("visrag", {}).get("nemo_model", "nvidia/llama-nemotron-embed-vl-1b-v2")
+    qwen3vl_model = args.qwen3vl_model or cfg.get("visrag", {}).get("qwen3vl_model", "Qwen/Qwen3-VL-Embedding-8B")
 
     top_k_values = sorted(set(args.top_k_values or cfg.get("retrieval", {}).get("top_k_values", [1, 2, 5])))
     val_path = args.val or cfg.get("data", {}).get("val")
@@ -899,6 +1208,9 @@ def main(args):
 
     logger.info(f"Loading val data: {val_path}")
     val_all = load_webqa_samples(val_path)
+    if args.image_dir:
+        for s in val_all:
+            s["image_dir"] = args.image_dir
     for s in val_all:
         if "modality" not in s:
             s["modality"] = "image" if s.get("pos_image_ids") else "text"
@@ -907,7 +1219,7 @@ def main(args):
     logger.info(f"  val image: {len(val_image)}  val text: {len(val_text)}")
 
     requested = [m.lower() for m in args.methods]
-    valid = {"bm25", "dense", "full_context", "latent"}
+    valid = {"bm25", "dense", "nemo", "qwen3vl", "full_context", "latent"}
     methods = [m for m in requested if m in valid]
     fc_requested = "full_context" in methods
     retrieval_methods = [m for m in methods if m != "full_context"]
@@ -945,6 +1257,16 @@ def main(args):
         from sentence_transformers import SentenceTransformer
         logger.info(f"Loading shared dense encoder: {dense_model}")
         dense_encoder = SentenceTransformer(dense_model)
+    nemo_encoder = None
+    if "nemo" in retrieval_methods:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Loading shared NeMo multimodal encoder: {nemo_model}")
+        nemo_encoder = SentenceTransformer(nemo_model, trust_remote_code=True)
+    qwen3vl_encoder = None
+    if "qwen3vl" in retrieval_methods:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Loading shared Qwen3-VL embedding encoder: {qwen3vl_model}")
+        qwen3vl_encoder = SentenceTransformer(qwen3vl_model, trust_remote_code=True)
 
     val_pool = _prepare_eval_pool(val_all, args.max_samples)
     run_methods = []
@@ -953,14 +1275,20 @@ def main(args):
     run_methods.extend(retrieval_methods)
     results, dumped = run_unified_baselines_multik(
         val_all, generator, top_k_values, scale, args.max_samples, run_methods,
-        dense_model, dense_encoder=dense_encoder, pool=val_pool, compressor=compressor,
+        dense_model, dense_encoder=dense_encoder, nemo_encoder=nemo_encoder,
+        qwen3vl_encoder=qwen3vl_encoder, pool=val_pool, compressor=compressor,
         gen_batch_size=args.gen_batch_size,
         latent_query_batch_size=args.latent_query_batch_size,
+        latent_candidate_batch_size=args.latent_candidate_batch_size,
         dump_examples=args.dump_examples,
+        token_count_only=args.token_count_only,
     )
 
     result_obj = {"top_k_values": top_k_values, "results": results}
-    _print_results_report(results)
+    if args.token_count_only:
+        _print_token_only_report(results)
+    else:
+        _print_results_report(results)
     if args.output:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
@@ -979,12 +1307,26 @@ if __name__ == "__main__":
     parser.add_argument("--config", required=True)
     parser.add_argument("--val", default=None)
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--generator_model", default=None, help="Override multimodal generator model used for inference.")
     parser.add_argument("--methods", nargs="+", default=["full_context", "bm25", "dense"])
     parser.add_argument("--top_k_values", type=int, nargs="+", default=None)
     parser.add_argument("--max_samples", type=int, default=200)
+    parser.add_argument("--image_dir", default=None)
+    parser.add_argument("--nemo_model", default=None,
+                        help="NeMo multimodal embedding model id or local path. Overrides config visrag.nemo_model.")
+    parser.add_argument("--qwen3vl_model", default=None,
+                        help="Qwen3-VL embedding model id or local path. Overrides config visrag.qwen3vl_model.")
     parser.add_argument("--gen_batch_size", type=int, default=8)
     parser.add_argument("--latent_query_batch_size", type=int, default=128)
+    parser.add_argument("--latent_candidate_batch_size", type=int, default=4,
+                        help="Micro-batch size for compressing per-sample latent retrieval candidates.")
     parser.add_argument("--dump_examples", type=int, default=0)
-    parser.add_argument("--output", default="results/baselines_qwen.json")
+    parser.add_argument("--token_count_only", action="store_true",
+                        help="Run retrieval/prompt construction only and report token counts without generation.")
+    parser.add_argument("--disable_tqdm", action="store_true",
+                        help="Disable tqdm progress bars in baseline loops.")
+    parser.add_argument("--simple_tqdm", action="store_true",
+                        help="Show only outer sample-level tqdm bars, hiding batch-level bars.")
+    parser.add_argument("--output", default="results/baselines_gemma.json")
     args = parser.parse_args()
     main(args)

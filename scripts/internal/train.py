@@ -37,6 +37,10 @@ import os
 import random
 import sys
 
+_RELEASE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _RELEASE_ROOT not in sys.path:
+    sys.path.insert(0, _RELEASE_ROOT)
+
 import torch
 import yaml
 from torch.optim import AdamW
@@ -661,12 +665,12 @@ if __name__ == "__main__":
                         help="Path to YAML config file.")
     parser.add_argument("--data",   default="data/hotpotqa_train.json",
                         help="Path to training samples JSON (or dataset name).")
-    parser.add_argument("--output", default="/scratch/e1374322/latent-retrieval-save/checkpoints/model.pt",
+    parser.add_argument("--output", default="checkpoints/model.pt",
                         help="Path for the final checkpoint.")
     parser.add_argument("--val_data", default=None,
                         help="Optional path to validation samples JSON. "
                              "If omitted, 10%% of training data is used.")
-    parser.add_argument("--logdir", default="/scratch/e1374322/latent-retrieval-save/tb_logs",
+    parser.add_argument("--logdir", default=None,
                         help="TensorBoard log directory.")
     args = parser.parse_args()
     train(args)

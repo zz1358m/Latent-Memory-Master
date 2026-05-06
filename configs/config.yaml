@@ -1,0 +1,125 @@
+# ============================================================
+# Latent Sentence Retrieval - H200 (141GB HBM3) Configuration
+# ============================================================
+
+model:
+  # Compressor (sentence → 1 latent token): lightweight 1B
+  compressor_name: "meta-llama/Llama-3.2-1B-Instruct"
+  # Generator (retrieved latents + query → answer): powerful 8B
+  generator_name: "meta-llama/Llama-3.1-8B-Instruct"
+  dtype: "bfloat16"
+  # Hidden dimensions (auto-derived from models, listed here for reference)
+  compressor_hidden: 2048   # Llama-3.2-1B hidden size
+  generator_hidden: 4096    # Llama-3.1-8B hidden size
+
+compressor:
+  # Number of learned [MEM] latent tokens per compressed evidence item.
+  # Retrieval averages these tokens; reconstruction/generation consume them in order.
+  num_latent_tokens: 1
+  lora_r: 64                  # increased from 32
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # all attention
+  retrieval_dim: 512
+
+decoder:
+  lora_r: 64                  # increased from 32
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
+
+# Dedicated query encoder adapter (trained only by L_contrast query side)
+# Separate from "compress" adapter to avoid gradient conflict with L_recon
+query:
+  lora_r: 64
+  lora_alpha: 128
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+training:
+  learning_rate: 1.0e-4
+  batch_size: 8
+  gradient_accumulation_steps: 4   # effective batch = 64
+  num_epochs: 3
+  warmup_steps: 0
+  # Loss weights
+  lambda_recon: 0.5
+  lambda_contrast: 0.2
+  lambda_distill: 1.0
+  recon_negatives: True        # include hard negatives in sentence reconstruction loss
+  recon_query: False             # include query reconstruction loss (L_recon_query)
+  # Contrastive
+  temperature: 0.07
+  max_hard_negatives: 8         # randomly sampled negatives per sample for contrastive loss
+  # Distillation
+  distill_layers: [-1]        # supervise last layer only (fast); add [8,16,24,-1] for thorough
+  n_distill_tokens: 16         # number of answer tokens to distill (1 = first token only)
+  student_distill_hard_negatives_max: 3  # student-only extra hard negatives for distillation; teacher stays positive-only
+  save_dir: "checkpoints/"
+  log_every: 10
+  val_every: 2000              # run validation every N optimizer steps
+  val_samples: 1000            # number of val samples per periodic check
+
+data:
+  # HotpotQA distractor config:
+  #   train: 90,447 samples × ~40 sentences = ~3.6M sentences total
+  #   val:    7,405 samples (for eval)
+  #   supporting_facts = ground-truth positive sentence labels (no heuristics needed)
+  #   distractors = 8 misleading paragraphs per question = perfect hard negatives
+  dataset: "hotpotqa"
+  split: "train"
+  max_samples: -1             # -1 = full 90k train set
+  cache_dir: "data/cache/"
+  max_sentence_length: 512
+  min_sentence_length: 5
+
+retrieval:
+  top_k: 5
+  index_type: "flat"          # flat for <1M sentences; switch to "ivf" for larger corpora
+
+generation:
+  max_new_tokens: 32
+  temperature: 0.0
+
+rag_baseline:
+  chunk_size: 512
+  chunk_overlap: 64
+  top_k: 5
+  embedder: "sentence-transformers/all-MiniLM-L6-v2"
+
+paths:
+  checkpoint: "checkpoints/model.pt"
+  sentence_index: "sentence_index/"
+  results_dir: "results/"
+
+# ---------------------------------------------------------------------------
+# Compression baseline checkpoints
+# ---------------------------------------------------------------------------
+compression_baselines:
+  llmlingua:
+    model: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
+    compression_ratio: 0.2
+
+  autocompressor:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+
+  # AutoCompressor variant 1: 512-token segments, 50 summary tokens per segment
+  autocompressor_512_50:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+    segment_length: 512
+    summary_length: 50
+
+  # AutoCompressor variant 2: full context as one segment, 50 summary tokens total
+  autocompressor_full_50:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+    segment_length: 4096
+    summary_length: 50
+
+  lcc:
+    checkpoint: "checkpoints/model.pt"
+    compressor_name:  "meta-llama/Llama-3.2-1B-Instruct"
+    num_buffer_tokens: 64
+
+  xrag:
+    model:             "Hannibal046/xrag-7b"
+    retrieval_encoder: "Salesforce/SFR-Embedding-Mistral"
+    xrag_src:          "third_party/xRAG"

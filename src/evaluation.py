@@ -282,6 +282,8 @@ def evaluate(
     predictions: List[str],
     references: List[List[str]],
     token_counts: Optional[List[int]] = None,
+    token_counts_no_system: Optional[List[int]] = None,
+    token_counts_context_only: Optional[List[int]] = None,
     sample_metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, float]:
     """
@@ -292,6 +294,12 @@ def evaluate(
     predictions  : list of generated answer strings
     references   : list of reference answer lists (multiple refs per question)
     token_counts : optional list of input token counts per query
+    token_counts_no_system : optional list of input token counts excluding fixed
+                             system/template prefix, counted from the first
+                             Context:/Latent context marker onward
+    token_counts_context_only : optional list of input token counts restricted to
+                                the context span only, from first Context:/Latent
+                                marker up to but not including Question:
 
     Returns
     -------
@@ -327,6 +335,12 @@ def evaluate(
     if token_counts is not None:
         results["avg_tokens"] = float(np.mean(token_counts))
         results["total_tokens"] = int(np.sum(token_counts))
+    if token_counts_no_system is not None:
+        results["avg_tokens_no_system"] = float(np.mean(token_counts_no_system))
+        results["total_tokens_no_system"] = int(np.sum(token_counts_no_system))
+    if token_counts_context_only is not None:
+        results["avg_tokens_context_only"] = float(np.mean(token_counts_context_only))
+        results["total_tokens_context_only"] = int(np.sum(token_counts_context_only))
 
     return results
 
@@ -348,6 +362,10 @@ def print_results(results: Dict, method_name: str = ""):
         print(f"  Recall@1    : {results['recall_at_1']:.4f}")
     if "avg_tokens" in results:
         print(f"  Avg Tokens  : {results['avg_tokens']:.1f}")
+    if "avg_tokens_no_system" in results:
+        print(f"  Avg Tokens* : {results['avg_tokens_no_system']:.1f}")
+    if "avg_tokens_context_only" in results:
+        print(f"  Avg Tokens† : {results['avg_tokens_context_only']:.1f}")
     print(f"  N Samples   : {results.get('n_samples', 0)}")
     print()
 
@@ -366,6 +384,12 @@ def compare_results(results_dict: Dict[str, Dict]) -> None:
     if has_recall_1:
         header += f" {'Recall@1':>10}"
     header += f" {'Tokens':>10}"
+    has_tokens_no_system = any("avg_tokens_no_system" in r for r in results_dict.values())
+    if has_tokens_no_system:
+        header += f" {'Tok*':>10}"
+    has_tokens_context_only = any("avg_tokens_context_only" in r for r in results_dict.values())
+    if has_tokens_context_only:
+        header += f" {'Tok†':>10}"
     sep = "=" * len(header)
     print("\n" + sep)
     print(header)
@@ -385,5 +409,11 @@ def compare_results(results_dict: Dict[str, Dict]) -> None:
         if has_recall_1:
             row += f" {res.get('recall_at_1', float('nan')):>10.4f}"
         row += f" {tokens:>10}"
+        if has_tokens_no_system:
+            tokens_no_system = f"{res['avg_tokens_no_system']:.0f}" if "avg_tokens_no_system" in res else "N/A"
+            row += f" {tokens_no_system:>10}"
+        if has_tokens_context_only:
+            tokens_context_only = f"{res['avg_tokens_context_only']:.0f}" if "avg_tokens_context_only" in res else "N/A"
+            row += f" {tokens_context_only:>10}"
         print(row)
     print(sep + "\n")
