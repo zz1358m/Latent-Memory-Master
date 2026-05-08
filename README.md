@@ -23,6 +23,10 @@ runs/       Ready-to-edit YAML and shell launchers for the main experiments.
 pip install -r requirements.txt
 ```
 
+## Released Checkpoints and Datasets Offline
+
+https://huggingface.co/zz1358m/Latent-Memory-Master
+
 ## Main workflow
 
 The default release workflow is intentionally simple:
