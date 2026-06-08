@@ -1,0 +1,106 @@
+# ============================================================
+# Latent Sentence Retrieval - Llama 1B compressor -> Mistral 7B generator
+# ============================================================
+
+model:
+  compressor_name: "meta-llama/Llama-3.2-1B-Instruct"
+  generator_name: "mistralai/Mistral-7B-Instruct-v0.3"
+  dtype: "bfloat16"
+  compressor_hidden: 2048
+  generator_hidden: 4096
+
+compressor:
+  num_latent_tokens: 1
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  retrieval_dim: 512
+
+decoder:
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
+
+query:
+  lora_r: 64
+  lora_alpha: 128
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+training:
+  learning_rate: 1.0e-4
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_epochs: 3
+  warmup_steps: 0
+  lambda_recon: 0.5
+  lambda_contrast: 0.2
+  lambda_distill: 1.0
+  recon_negatives: true
+  recon_query: false
+  temperature: 0.07
+  max_hard_negatives: 8
+  distill_layers: [-1]
+  n_distill_tokens: 16
+  student_distill_hard_negatives_max: 3
+  save_dir: "checkpoints/text_llama_mistral/"
+  log_every: 10
+  val_every: 2000
+  val_samples: 1000
+
+data:
+  dataset: "hotpotqa"
+  split: "train"
+  max_samples: -1
+  cache_dir: "data/cache/"
+  max_sentence_length: 512
+  min_sentence_length: 5
+
+retrieval:
+  top_k: 5
+  top_k_values: [1, 2, 5]
+  index_type: "flat"
+
+generation:
+  max_new_tokens: 32
+  temperature: 0.0
+
+rag_baseline:
+  chunk_size: 512
+  chunk_overlap: 64
+  top_k: 5
+  embedder: "sentence-transformers/all-MiniLM-L6-v2"
+
+paths:
+  checkpoint: "checkpoints/text_llama_mistral/model_best.pt"
+  sentence_index: "sentence_index/text_llama_mistral/"
+  results_dir: "results/text_llama_mistral/"
+
+compression_baselines:
+  llmlingua:
+    model: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
+    compression_ratio: 0.2
+
+  autocompressor:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+
+  autocompressor_512_50:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+    segment_length: 512
+    summary_length: 50
+
+  autocompressor_full_50:
+    model: "princeton-nlp/AutoCompressor-Llama-2-7b-6k"
+    segment_length: 4096
+    summary_length: 50
+
+  lcc:
+    checkpoint: "checkpoints/text_llama_mistral/model_best.pt"
+    compressor_name: "meta-llama/Llama-3.2-1B-Instruct"
+    num_buffer_tokens: 64
+
+  xrag:
+    model: "Hannibal046/xrag-7b"
+    retrieval_encoder: "Salesforce/SFR-Embedding-Mistral"
+    xrag_src: "third_party/xRAG"

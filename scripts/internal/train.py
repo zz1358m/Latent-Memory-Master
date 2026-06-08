@@ -405,6 +405,11 @@ def train(args):
         num_latent_tokens=comp_cfg.get("num_latent_tokens", 1),
     ).to(device)
 
+    init_checkpoint = getattr(args, "init_checkpoint", None)
+    if init_checkpoint:
+        logger.info(f"Loading initialization checkpoint: {init_checkpoint}")
+        autoencoder.load(init_checkpoint)
+
     # --- Load frozen 8B generator (for distillation loss + validation) ---
     generator, generator_tokenizer = None, None
     needs_generator = (
@@ -672,5 +677,7 @@ if __name__ == "__main__":
                              "If omitted, 10%% of training data is used.")
     parser.add_argument("--logdir", default=None,
                         help="TensorBoard log directory.")
+    parser.add_argument("--init_checkpoint", default=None,
+                        help="Optional autoencoder checkpoint to initialize from before training.")
     args = parser.parse_args()
     train(args)

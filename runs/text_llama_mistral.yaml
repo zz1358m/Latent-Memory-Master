@@ -1,0 +1,17 @@
+# Text-only Latent Memory run with a trained Llama encoder LoRA and Mistral generator.
+config: configs/config_llama1b_mistral7b.yaml
+train_data: data/hotpotqa_train.json
+val_data: data/hotpotqa_val.json
+test_data: data/hotpotqa_val.json
+checkpoint: checkpoints/text_llama_mistral/model_best.pt
+output_dir: results/text_llama_mistral
+top_k_values: [1, 2, 5]
+max_new_tokens: 32
+
+steps:
+  train: false
+  evaluate: true
+
+optional:
+  build_memory_bank: false
+  memory_bank: memory_bank/text_llama_mistral
