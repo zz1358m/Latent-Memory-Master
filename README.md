@@ -1,4 +1,4 @@
-# Latent Memory
+# Latent Memory 🧠
 
 Release-oriented code for Latent Memory: compact latent evidence representations for retrieval-augmented question answering.
 
@@ -17,7 +17,7 @@ configs/    Main YAML configs for text-only, LLaVA multimodal, and Gemma multimo
 runs/       Ready-to-edit YAML and shell launchers for the main experiments.
 ```
 
-## Installation
+## Installation ⚙️
 
 ```bash
 pip install -r requirements.txt
@@ -25,9 +25,9 @@ pip install -r requirements.txt
 
 ## Released Checkpoints and Datasets Offline
 
-https://huggingface.co/zz1358m/Latent-Memory-Master
+Download the released data and checkpoints from [zz1358m/Latent-Memory-Master](https://huggingface.co/zz1358m/Latent-Memory-Master) before running the examples. 📦
 
-## Main workflow
+## Main workflow 🚀
 
 The default release workflow is intentionally simple:
 
@@ -37,7 +37,7 @@ train -> eval
 
 Memory-bank construction is optional and only needed for offline indexing over a fixed corpus. The multimodal evaluation scripts build per-sample candidate pools online and do not require a separate compile step.
 
-## Ready-to-run entry points
+## Ready-to-run entry points ▶️
 
 ```bash
 bash runs/run_text_llama.sh
