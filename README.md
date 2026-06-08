@@ -2,6 +2,10 @@
 
 Release-oriented code for Latent Memory: compact latent evidence representations for retrieval-augmented question answering.
 
+## Overview
+
+![Latent Memory overview](asserts/figure.png)
+
 This repository contains the core `src/` modules and executable `scripts/` for four experiment families:
 
 - Text-only LLaMA experiments: LLaMA compressor with a frozen LLaMA generator.
