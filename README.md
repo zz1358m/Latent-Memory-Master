@@ -1,6 +1,6 @@
 # Latent Memory 🧠
 
-Release-oriented code for Latent Memory: compact latent evidence representations for retrieval-augmented question answering.
+Code for One Token per Multimodal Evidence: Latent Memory for Resource-Constrained QA. [Arxiv](https://arxiv.org/pdf/2606.10572)
 
 ## Overview
 
